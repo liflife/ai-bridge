@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Agent</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="logo">
+          <span class="logo-icon">🤖</span>
+          <span class="logo-text">AI Agent</span>
+        </div>
+        <button id="btn-new-project" class="btn-new-chat">
+          <span>+ 新建项目</span>
+        </button>
+      </div>
+
+      <div class="sidebar-info">
+        <div class="info-row">
+          <span class="info-icon">🌐</span>
+          <select id="site-select" class="site-select">
+            <option value="deepseek">DeepSeek</option>
+            <option value="chatgpt">ChatGPT</option>
+            <option value="claude">Claude</option>
+            <option value="gemini">Gemini</option>
+            <option value="kimi">Kimi</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="sidebar-sessions">
+        <div class="sessions-header">
+          <span>项目 / 会话</span>
+          <span id="project-count" class="badge">0</span>
+        </div>
+        <ul id="project-list" class="project-list"></ul>
+      </div>
+    </aside>
+
+    <main class="main">
+      <!-- 顶部：当前项目路径 -->
+      <div class="topbar" id="topbar">
+        <div class="topbar-left">
+          <span class="topbar-icon">📁</span>
+          <span id="topbar-path" class="topbar-path">未选择项目</span>
+        </div>
+        <div class="topbar-right">
+          <span id="topbar-session" class="topbar-session"></span>
+        </div>
+      </div>
+
+      <div id="messages" class="messages">
+        <div class="welcome">
+          <div class="welcome-icon">🤖</div>
+          <div class="welcome-title">欢迎使用 AI Agent</div>
+          <div class="welcome-hint">请先在左侧创建或选择一个项目</div>
+        </div>
+      </div>
+
+      <div class="input-area">
+        <div class="input-wrapper">
+          <textarea
+            id="task-input"
+            placeholder="输入消息... Ctrl+Enter 发送"
+            rows="1"
+            disabled
+          ></textarea>
+          <div class="input-actions">
+            <button id="btn-stop" class="btn-stop" style="display:none;">⏹ 停止</button>
+            <button id="btn-send" class="btn-send" disabled>发送</button>
+          </div>
+        </div>
+        <div class="input-hint">
+          <span id="status-text">就绪</span>
+          <span id="session-id-display" class="session-id"></span>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- 新建项目对话框 -->
+  <div id="project-modal" class="modal" style="display:none;">
+    <div class="modal-content">
+      <div class="modal-title">新建项目</div>
+      <div class="modal-desc">项目代表一个本地代码目录。Agent 生成的文件会保存到这里。</div>
+
+      <label class="modal-label">项目名称</label>
+      <input id="project-name-input" type="text" placeholder="例如 huaban">
+
+      <label class="modal-label">本地路径</label>
+      <input id="project-path-input" type="text" placeholder="例如 F:/project/huaban">
+
+      <div class="modal-actions">
+        <button id="project-cancel" class="btn-secondary">取消</button>
+        <button id="project-confirm" class="btn-primary">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

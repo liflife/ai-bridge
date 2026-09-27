@@ -1,19 +1,20 @@
 #!/usr/bin/env node
 // ==========================================
 // agent/cli.js
-// 交互式命令行 AI Agent（粘贴多行 + 回车确认 + 会话保存）
+// 交互式命令行 AI Agent（项目/会话 + 多行 + abort）
 // ==========================================
 import readline from "readline";
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
+import crypto from "crypto";
 import { runAgent } from "./agent.js";
 
 // ==========================================
 // 常量
 // ==========================================
 const SERVER_URL = "http://127.0.0.1:8787";
-const SESSIONS_DIR = path.join(os.homedir(), ".ai-bridge-agent", "sessions");
+const PROJECTS_DIR = path.join(os.homedir(), ".ai-bridge-agent", "projects");
 const DEBOUNCE_MS = 300;
 
 // ==========================================
@@ -25,13 +26,16 @@ const STATE = {
   url: null,
   createdAt: new Date().toISOString(),
   savedName: null,
+  projectKey: null,       // ★ 当前项目 key
+  workdir: null,          // ★ 由 project 决定
   busy: false,
   cancelling: false,
   currentAbort: null,
   taskHistory: [],
   taskCount: 0,
   startedAt: Date.now(),
-  lastSessionList: [],   // 缓存最近列出的会话，供 /load <编号> 使用
+  lastSessionList: [],
+  lastProjectList: [],
 };
 
 // ==========================================
@@ -80,7 +84,6 @@ function sanitizeName(name) {
   return String(name).replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80);
 }
 
-// ★ 新增：从 URL 提取 UUID
 function extractUuidFromUrl(url) {
   if (!url) return null;
   const m = url.match(/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i);
@@ -88,28 +91,152 @@ function extractUuidFromUrl(url) {
 }
 
 // ==========================================
-// 会话存储
+// 项目存储
 // ==========================================
-async function ensureSessionsDir() {
-  await fs.mkdir(SESSIONS_DIR, { recursive: true });
+function getProjectDir(key) {
+  return path.join(PROJECTS_DIR, key);
+}
+function getProjectMetaPath(key) {
+  return path.join(getProjectDir(key), "project.json");
+}
+function getSessionsDir(key) {
+  return path.join(getProjectDir(key), "sessions");
 }
 
-async function listSavedSessions() {
-  await ensureSessionsDir();
-  const files = await fs.readdir(SESSIONS_DIR);
+async function readProject(key) {
+  return JSON.parse(await fs.readFile(getProjectMetaPath(key), "utf-8"));
+}
+
+async function writeProject(key, data) {
+  await fs.mkdir(getProjectDir(key), { recursive: true });
+  await fs.writeFile(getProjectMetaPath(key), JSON.stringify(data, null, 2), "utf-8");
+}
+
+async function listProjects() {
+  await fs.mkdir(PROJECTS_DIR, { recursive: true });
+  const entries = await fs.readdir(PROJECTS_DIR, { withFileTypes: true });
+  const result = [];
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    try {
+      const meta = JSON.parse(await fs.readFile(getProjectMetaPath(e.name), "utf-8"));
+      result.push(meta);
+    } catch {}
+  }
+  result.sort((a, b) => (b.lastUsedAt || "").localeCompare(a.lastUsedAt || ""));
+  return result;
+}
+
+async function ensureProject(key, workdir) {
+  const dir = getProjectDir(key);
+  await fs.mkdir(path.join(dir, "sessions"), { recursive: true });
+  const metaPath = getProjectMetaPath(key);
+  try {
+    const meta = JSON.parse(await fs.readFile(metaPath, "utf-8"));
+    meta.lastUsedAt = new Date().toISOString();
+    await fs.writeFile(metaPath, JSON.stringify(meta, null, 2), "utf-8");
+    return meta;
+  } catch {
+    const now = new Date().toISOString();
+    const meta = {
+      name: key,
+      key,
+      path: workdir,
+      createdAt: now,
+      lastUsedAt: now,
+    };
+    await fs.writeFile(metaPath, JSON.stringify(meta, null, 2), "utf-8");
+    return meta;
+  }
+}
+
+// 从 cwd 派生项目：basename，冲突则加 hash
+async function findOrCreateProjectForCwd(cwd) {
+  const abs = path.resolve(cwd);
+  const base = sanitizeName(path.basename(abs) || "default");
+
+  // 1) 尝试 base
+  try {
+    const meta = JSON.parse(await fs.readFile(getProjectMetaPath(base), "utf-8"));
+    if (path.resolve(meta.path) === abs) {
+      // path 一致，直接复用
+      meta.lastUsedAt = new Date().toISOString();
+      await writeProject(base, meta);
+      return { key: base, meta };
+    }
+    // path 不一致 → 用 base-hash
+    const hash = crypto.createHash("md5").update(abs).digest("hex").slice(0, 6);
+    const keyWithHash = `${base}-${hash}`;
+    try {
+      const meta2 = JSON.parse(await fs.readFile(getProjectMetaPath(keyWithHash), "utf-8"));
+      return { key: keyWithHash, meta: meta2 };
+    } catch {
+      const now = new Date().toISOString();
+      const m = {
+        name: base,
+        key: keyWithHash,
+        path: abs,
+        createdAt: now,
+        lastUsedAt: now,
+      };
+      await fs.mkdir(getSessionsDir(keyWithHash), { recursive: true });
+      await writeProject(keyWithHash, m);
+      return { key: keyWithHash, meta: m };
+    }
+  } catch {
+    // base 不存在，直接创建
+    const now = new Date().toISOString();
+    const m = {
+      name: base,
+      key: base,
+      path: abs,
+      createdAt: now,
+      lastUsedAt: now,
+    };
+    await fs.mkdir(getSessionsDir(base), { recursive: true });
+    await writeProject(base, m);
+    return { key: base, meta: m };
+  }
+}
+
+// ==========================================
+// 会话存储（基于项目）
+// ==========================================
+async function listProjectSessions(key) {
+  await fs.mkdir(getSessionsDir(key), { recursive: true });
+  const files = await fs.readdir(getSessionsDir(key));
   const result = [];
   for (const f of files) {
     if (!f.endsWith(".json")) continue;
     try {
-      const content = await fs.readFile(path.join(SESSIONS_DIR, f), "utf-8");
+      const content = await fs.readFile(path.join(getSessionsDir(key), f), "utf-8");
       result.push(JSON.parse(content));
     } catch {}
   }
-  // ★ 按 updatedAt 倒序
   result.sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
   return result;
 }
 
+async function readSessionFile(key, name) {
+  const p = path.join(getSessionsDir(key), `${sanitizeName(name)}.json`);
+  return JSON.parse(await fs.readFile(p, "utf-8"));
+}
+
+async function writeSessionFile(key, name, data) {
+  await fs.mkdir(getSessionsDir(key), { recursive: true });
+  const p = path.join(getSessionsDir(key), `${sanitizeName(name)}.json`);
+  await fs.writeFile(p, JSON.stringify(data, null, 2), "utf-8");
+  return p;
+}
+
+async function deleteSessionFile(key, name) {
+  const p = path.join(getSessionsDir(key), `${sanitizeName(name)}.json`);
+  await fs.unlink(p);
+}
+
+// ==========================================
+// 服务端交互
+// ==========================================
 async function refreshUrlFromServer() {
   try {
     const res = await fetch(`${SERVER_URL}/v1/sessions/${encodeURIComponent(STATE.sessionId)}`);
@@ -123,12 +250,13 @@ async function refreshUrlFromServer() {
   } catch {}
 }
 
+// ==========================================
+// 保存/加载（基于项目）
+// ==========================================
 async function saveSessionToDisk(name) {
-  await ensureSessionsDir();
   await refreshUrlFromServer();
 
   const data = {
-    name,
     sessionId: STATE.sessionId,
     site: STATE.site,
     url: STATE.url,
@@ -138,21 +266,7 @@ async function saveSessionToDisk(name) {
     taskHistory: STATE.taskHistory.slice(-50),
   };
 
-  const file = path.join(SESSIONS_DIR, `${name}.json`);
-  await fs.writeFile(file, JSON.stringify(data, null, 2), "utf-8");
-  return file;
-}
-
-async function loadSessionFromDisk(name) {
-  await ensureSessionsDir();
-  const file = path.join(SESSIONS_DIR, `${name}.json`);
-  const content = await fs.readFile(file, "utf-8");
-  return JSON.parse(content);
-}
-
-async function deleteSessionFromDisk(name) {
-  const file = path.join(SESSIONS_DIR, `${name}.json`);
-  await fs.unlink(file);
+  return await writeSessionFile(STATE.projectKey, name, data);
 }
 
 // ==========================================
@@ -164,6 +278,8 @@ function printBanner() {
   console.log(c("cyan", "║") + c("bold", "           🤖  AI Agent 命令行版                    ") + c("cyan", "║"));
   console.log(c("cyan", "╚═══════════════════════════════════════════════════╝"));
   console.log("");
+  console.log(`  项目:      ${c("yellow", STATE.projectKey)}`);
+  console.log(`  工作目录:  ${c("gray", STATE.workdir)}`);
   console.log(`  站点:      ${c("yellow", STATE.site)}`);
   console.log(`  会话 ID:   ${c("gray", STATE.sessionId)}`);
   if (STATE.url) {
@@ -172,7 +288,6 @@ function printBanner() {
   if (STATE.savedName) {
     console.log(`  已保存为:  ${c("green", STATE.savedName)}`);
   }
-  console.log(`  工作目录:  ${c("gray", process.cwd())}`);
   console.log("");
   console.log(c("gray", "  输入 /help 查看帮助  ·  Ctrl+C 取消任务/退出"));
   console.log(c("gray", "  粘贴多行后按回车确认发送"));
@@ -191,20 +306,24 @@ function printHelp() {
   console.log(`    ${c("yellow", "/history")}             显示任务历史`);
   console.log("");
   console.log(c("bold", "  会话:"));
-  console.log(`    ${c("yellow", "/new")}                 开始新会话（会断开当前）`);
+  console.log(`    ${c("yellow", "/new")}                 开始新会话`);
   console.log(`    ${c("yellow", "/site <name>")}         切换站点`);
   console.log(`    ${c("yellow", "/sites")}               列出支持的站点`);
   console.log("");
-  console.log(c("bold", "  保存/恢复:"));
-  console.log(`    ${c("yellow", "/save [name]")}         保存会话`);
-  console.log(c("gray", "        不带 name → 自动用 URL 里的 UUID"));
-  console.log(`    ${c("yellow", "/sessions")}            列出所有已保存的会话（带编号）`);
-  console.log(`    ${c("yellow", "/load")}                列出会话 + 提示如何选择`);
+  console.log(c("bold", "  项目:"));
+  console.log(`    ${c("yellow", "/projects")}            列出所有项目`);
+  console.log(`    ${c("yellow", "/project")}             显示当前项目`);
+  console.log(`    ${c("yellow", "/project <key>")}       切换到指定项目`);
+  console.log("");
+  console.log(c("bold", "  保存/恢复（当前项目下）:"));
+  console.log(`    ${c("yellow", "/save [name]")}         保存会话（不带 name → 用 URL 的 UUID）`);
+  console.log(`    ${c("yellow", "/sessions")}            列出当前项目的会话`);
+  console.log(`    ${c("yellow", "/load")}                列出会话`);
   console.log(`    ${c("yellow", "/load <编号>")}         按编号加载，如 /load 1`);
   console.log(`    ${c("yellow", "/load <name>")}         按名字加载`);
-  console.log(`    ${c("yellow", "/unsave <name>")}       删除已保存的会话`);
+  console.log(`    ${c("yellow", "/unsave <name>")}       删除会话`);
   console.log("");
-  console.log(c("gray", `  会话保存位置: ${SESSIONS_DIR}`));
+  console.log(c("gray", `  项目根目录: ${PROJECTS_DIR}`));
   console.log("");
 }
 
@@ -223,6 +342,8 @@ function printStatus() {
   console.log("");
   console.log(c("cyan", "📊 当前状态:"));
   console.log("");
+  console.log(`  项目:       ${c("yellow", STATE.projectKey)}`);
+  console.log(`  工作目录:   ${c("gray", STATE.workdir)}`);
   console.log(`  站点:       ${c("yellow", STATE.site)}`);
   console.log(`  会话 ID:    ${c("gray", STATE.sessionId)}`);
   if (STATE.url) {
@@ -235,7 +356,6 @@ function printStatus() {
   }
   console.log(`  任务数:     ${STATE.taskCount}`);
   console.log(`  运行时长:   ${formatElapsed(Date.now() - STATE.startedAt)}`);
-  console.log(`  工作目录:   ${c("gray", process.cwd())}`);
   console.log("");
 }
 
@@ -349,6 +469,14 @@ async function handleCommand(input) {
       await handleUnsave(args[0]);
       break;
 
+    case "/projects":
+      await handleListProjects();
+      break;
+
+    case "/project":
+      await handleProject(args[0]);
+      break;
+
     default:
       console.log("");
       console.log(c("red", `  ⚠️ 未知命令: ${cmd}`));
@@ -358,25 +486,96 @@ async function handleCommand(input) {
 }
 
 // ==========================================
+// 项目命令
+// ==========================================
+async function handleListProjects() {
+  try {
+    const list = await listProjects();
+    STATE.lastProjectList = list;
+    console.log("");
+    if (list.length === 0) {
+      console.log(c("gray", "  (暂无项目)"));
+      console.log("");
+      return;
+    }
+    console.log(c("cyan", `📂 项目列表 (${list.length}):`));
+    console.log("");
+    list.forEach((p, i) => {
+      const isCurrent = p.key === STATE.projectKey;
+      const marker = isCurrent ? c("green", " ← 当前") : "";
+      console.log(`  ${c("yellow", `[${i + 1}]`)} ${p.key}${marker}`);
+      console.log(c("gray", `      path: ${p.path}`));
+      console.log(c("gray", `      更新: ${(p.lastUsedAt || "-").slice(0, 19)}`));
+    });
+    console.log("");
+    console.log(c("gray", "  用 /project <key> 切换"));
+    console.log("");
+  } catch (e) {
+    console.log(c("red", `  ❌ ${e.message}`));
+  }
+}
+
+async function handleProject(arg) {
+  if (!arg) {
+    console.log("");
+    console.log(`  当前项目: ${c("yellow", STATE.projectKey)}`);
+    console.log(`  工作目录: ${c("gray", STATE.workdir)}`);
+    console.log(c("gray", "  用法: /project <key>  或  /projects 查看所有"));
+    console.log("");
+    return;
+  }
+  const key = sanitizeName(arg);
+  try {
+    const meta = await readProject(key);
+    const abs = path.resolve(meta.path);
+    const stat = await fs.stat(abs);
+    if (!stat.isDirectory()) throw new Error("不是目录");
+
+    STATE.projectKey = key;
+    STATE.workdir = abs;
+    // 切换项目 → 新会话
+    STATE.sessionId = newSessionId();
+    STATE.url = null;
+    STATE.createdAt = new Date().toISOString();
+    STATE.savedName = null;
+    STATE.taskHistory = [];
+    STATE.taskCount = 0;
+    STATE.startedAt = Date.now();
+
+    // 更新 lastUsedAt
+    meta.lastUsedAt = new Date().toISOString();
+    await writeProject(key, meta);
+
+    console.log("");
+    console.log(c("green", `  ✅ 已切换到项目: ${key}`));
+    console.log(`  工作目录: ${c("gray", STATE.workdir)}`);
+    console.log(`  会话 ID:  ${c("gray", STATE.sessionId)}`);
+    console.log("");
+  } catch (e) {
+    console.log("");
+    console.log(c("red", `  ❌ 无法切换项目: ${e.message}`));
+    console.log(c("gray", "  用 /projects 查看所有项目"));
+    console.log("");
+  }
+}
+
+// ==========================================
 // 保存
-// ★ 不带 name 时：优先用当前 savedName，其次从 URL 提取 UUID
 // ==========================================
 async function handleSave(name) {
-  // 1) 不传 name：如果已保存过，就更新原来的名字
   if (!name && STATE.savedName) {
     name = STATE.savedName;
   }
 
-  // 2) 还是不传 name：尝试从 URL 提取 UUID
   if (!name) {
     await refreshUrlFromServer();
     const uuid = extractUuidFromUrl(STATE.url);
     if (uuid) {
       name = uuid;
     } else {
-      name = "auto-" + new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      name = STATE.sessionId;
       console.log("");
-      console.log(c("yellow", "  ⚠️ 当前 URL 里没有 UUID，用时间戳命名"));
+      console.log(c("yellow", "  ⚠️ 当前 URL 里没有 UUID，用 sessionId 命名"));
     }
   }
 
@@ -387,6 +586,7 @@ async function handleSave(name) {
     STATE.savedName = name;
     console.log("");
     console.log(c("green", `  ✅ 会话已保存: ${name}`));
+    console.log(c("gray", `  项目: ${STATE.projectKey}`));
     console.log(c("gray", `  sessionId: ${STATE.sessionId}`));
     if (STATE.url) {
       console.log(c("gray", `  网页 URL:  ${STATE.url}`));
@@ -403,46 +603,18 @@ async function handleSave(name) {
 
 // ==========================================
 // 加载
-// ★ 不带参数 → 列出列表
-// ★ 数字 → 按编号
-// ★ 其他 → 按名字
 // ==========================================
 async function handleLoad(arg) {
-  // 1) 不带参数 → 列出会话
   if (!arg) {
-    const list = await listSavedSessions();
-    STATE.lastSessionList = list;
-
-    console.log("");
-    if (list.length === 0) {
-      console.log(c("gray", "  (暂无保存的会话，先用 /save 保存当前会话)"));
-      console.log("");
-      return;
-    }
-    console.log(c("cyan", `💾 已保存的会话 (${list.length}):`));
-    console.log("");
-    list.forEach((s, i) => {
-      const isCurrent = s.sessionId === STATE.sessionId;
-      const marker = isCurrent ? c("green", " ← 当前") : "";
-      const name = s.name.length > 40 ? s.name.slice(0, 37) + "..." : s.name;
-      console.log(`  ${c("yellow", `[${i + 1}]`)} ${name}${marker}`);
-      console.log(c("gray", `      站点: ${s.site}  任务: ${s.taskCount || 0}  更新: ${(s.updatedAt || "-").slice(0, 19)}`));
-      if (s.url) {
-        console.log(c("gray", `      url:  ${s.url}`));
-      }
-    });
-    console.log("");
-    console.log(c("gray", "  用法: /load <编号>  或  /load <name>"));
-    console.log("");
+    await handleListSessions();
     return;
   }
 
-  // 2) 判断是编号还是名字
   let name = arg;
   const num = parseInt(arg, 10);
   if (!isNaN(num) && String(num) === arg) {
     if (!STATE.lastSessionList || STATE.lastSessionList.length === 0) {
-      STATE.lastSessionList = await listSavedSessions();
+      STATE.lastSessionList = await listProjectSessions(STATE.projectKey);
     }
     if (num < 1 || num > STATE.lastSessionList.length) {
       console.log("");
@@ -450,14 +622,14 @@ async function handleLoad(arg) {
       console.log("");
       return;
     }
-    name = STATE.lastSessionList[num - 1].name;
+    const s = STATE.lastSessionList[num - 1];
+    name = s.name || s.sessionId;
   }
 
   name = sanitizeName(name);
 
-  // 3) 加载
   try {
-    const data = await loadSessionFromDisk(name);
+    const data = await readSessionFile(STATE.projectKey, name);
 
     STATE.sessionId = data.sessionId;
     STATE.site = data.site || STATE.site;
@@ -468,7 +640,6 @@ async function handleLoad(arg) {
     STATE.startedAt = Date.now();
     STATE.savedName = name;
 
-    // 通知 server 绑定
     if (STATE.url) {
       try {
         await fetch(`${SERVER_URL}/v1/sessions/bind`, {
@@ -487,6 +658,8 @@ async function handleLoad(arg) {
 
     console.log("");
     console.log(c("green", `  ✅ 已加载会话: ${name}`));
+    console.log(`  项目:      ${c("yellow", STATE.projectKey)}`);
+    console.log(`  工作目录:  ${c("gray", STATE.workdir)}`);
     console.log(`  站点:      ${c("yellow", STATE.site)}`);
     console.log(`  会话 ID:   ${c("gray", STATE.sessionId)}`);
     if (STATE.url) {
@@ -504,28 +677,26 @@ async function handleLoad(arg) {
   }
 }
 
-// ==========================================
-// 列出所有会话（带编号）
-// ==========================================
 async function handleListSessions() {
   try {
-    const list = await listSavedSessions();
+    const list = await listProjectSessions(STATE.projectKey);
     STATE.lastSessionList = list;
 
     console.log("");
     if (list.length === 0) {
-      console.log(c("gray", "  (暂无保存的会话)"));
+      console.log(c("gray", `  (项目 "${STATE.projectKey}" 暂无保存的会话)`));
       console.log(c("gray", "  用 /save 保存当前会话"));
       console.log("");
       return;
     }
-    console.log(c("cyan", `💾 已保存的会话 (${list.length}):`));
+    console.log(c("cyan", `💾 项目 "${STATE.projectKey}" 的会话 (${list.length}):`));
     console.log("");
     list.forEach((s, i) => {
       const isCurrent = s.sessionId === STATE.sessionId;
       const marker = isCurrent ? c("green", " ← 当前") : "";
-      const name = s.name.length > 40 ? s.name.slice(0, 37) + "..." : s.name;
-      console.log(`  ${c("yellow", `[${i + 1}]`)} ${name}${marker}`);
+      const name = (s.name || s.sessionId);
+      const showName = name.length > 40 ? name.slice(0, 37) + "..." : name;
+      console.log(`  ${c("yellow", `[${i + 1}]`)} ${showName}${marker}`);
       console.log(c("gray", `      站点: ${s.site}  任务: ${s.taskCount || 0}  更新: ${(s.updatedAt || "-").slice(0, 19)}`));
       if (s.url) {
         console.log(c("gray", `      url:  ${s.url}`));
@@ -548,7 +719,7 @@ async function handleUnsave(name) {
   }
   name = sanitizeName(name);
   try {
-    await deleteSessionFromDisk(name);
+    await deleteSessionFile(STATE.projectKey, name);
     if (STATE.savedName === name) STATE.savedName = null;
     console.log("");
     console.log(c("green", `  ✅ 已删除会话: ${name}`));
@@ -584,6 +755,7 @@ async function executeTask(task) {
       sessionId: STATE.sessionId,
       signal: STATE.currentAbort.signal,
       quiet: true,
+      workdir: STATE.workdir,        // ★ 从项目来
     });
     ok = result.ok;
     if (!result.ok) {
@@ -608,10 +780,8 @@ async function executeTask(task) {
     STATE.cancelling = false;
     STATE.currentAbort = null;
 
-    // 任务完成后刷新 url
     await refreshUrlFromServer();
 
-    // 自动更新已保存的会话
     if (STATE.savedName) {
       try {
         await saveSessionToDisk(STATE.savedName);
@@ -622,6 +792,19 @@ async function executeTask(task) {
 
     console.log("");
   }
+}
+
+// ==========================================
+// 初始化：确定项目
+// ==========================================
+async function initProject() {
+  await fs.mkdir(PROJECTS_DIR, { recursive: true });
+
+  const cwd = process.cwd();
+  const { key, meta } = await findOrCreateProjectForCwd(cwd);
+
+  STATE.projectKey = key;
+  STATE.workdir = path.resolve(meta.path);
 }
 
 // ==========================================
@@ -636,9 +819,6 @@ const rl = readline.createInterface({
 });
 
 let cancelTimer = null;
-
-printBanner();
-rl.prompt();
 
 // ==========================================
 // 输入缓冲
@@ -796,3 +976,10 @@ rl.on("close", () => {
     process.exit(0);
   })();
 });
+
+// ==========================================
+// 启动
+// ==========================================
+await initProject();
+printBanner();
+rl.prompt();

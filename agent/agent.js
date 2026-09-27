@@ -5,15 +5,16 @@ import { chat } from "./llm.js";
 import { tools, TOOL_DESCRIPTIONS } from "./tools.js";
 import os from "os";
 import path from "path";
+import fs from "fs/promises";
 
 // ==========================================
-// 收集系统信息
+// 收集系统信息（接受 workdir）
 // ==========================================
-function collectSystemInfo() {
+function collectSystemInfo(workdir) {
   const platform = os.platform();
   const arch = os.arch();
   const release = os.release();
-  const cwd = process.cwd();
+  const cwd = workdir || process.cwd();
   const home = os.homedir();
   const tmpdir = os.tmpdir();
   const nodeVersion = process.version;
@@ -39,19 +40,11 @@ function collectSystemInfo() {
   }
 
   return {
-    platformName,
-    platform,
-    arch,
-    release,
-    cwd,
-    home,
-    tmpdir,
+    platformName, platform, arch, release, cwd, home, tmpdir,
     nodeVersion,
     date: date.toISOString(),
     dateLocal: date.toString(),
-    sep,
-    pathStyle,
-    shellHint,
+    sep, pathStyle, shellHint,
   };
 }
 
@@ -86,18 +79,19 @@ function buildSystemSection(info) {
 }
 
 // ==========================================
-// 组装 System Prompt
+// 构建 System Prompt（每次调用用当前 workdir）
 // ==========================================
-const SYSTEM_INFO = collectSystemInfo();
-const SYSTEM_SECTION = buildSystemSection(SYSTEM_INFO);
+function buildSystemPrompt(workdir) {
+  const info = collectSystemInfo(workdir);
+  const section = buildSystemSection(info);
 
-const SYSTEM_PROMPT = `你是一个决策引擎，不直接执行任何操作。
+  return `你是一个决策引擎，不直接执行任何操作。
 
 你的唯一工作：每次回复只输出下面描述的内容。
 
 外部程序会读取你的输出，执行对应动作，然后把结果发回给你。你不需要自己去执行，也不需要说"我做不到"。
 
-${SYSTEM_SECTION}
+${section}
 
 ${TOOL_DESCRIPTIONS}
 
@@ -197,6 +191,7 @@ JSON 部分只是结构数据（thought、action、path），一般不含特殊�
 5. 每次回复必须且只能有一个 \`\`\`agent 代码块。
 
 现在开始，等待用户任务。`;
+}
 
 // ==========================================
 // 进度输出工具
@@ -206,10 +201,6 @@ function logStepHeader(step, maxSteps) {
   console.log(`┌───────────────────────────────────────────────────`);
   console.log(`│ 📍 步骤 ${step} / ${maxSteps}`);
   console.log(`└───────────────────────────────────────────────────`);
-}
-
-function logSubIcon(icon, text) {
-  console.log(`  ${icon} ${text}`);
 }
 
 function formatElapsed(ms) {
@@ -229,7 +220,10 @@ function summarizeToolInput(toolName, input) {
     const size = input.content ? `(${input.content.length} 字符)` : "";
     return `${input.path || "?"} ${size}`;
   }
-  if (toolName === "read_file" || toolName === "list_dir") {
+  if (toolName === "read_file" || toolName === "list_dir" ||
+      toolName === "file_exists" || toolName === "file_stat" ||
+      toolName === "read_lines" || toolName === "head" || toolName === "tail" ||
+      toolName === "mkdir" || toolName === "delete_file" || toolName === "delete_dir") {
     return `${input.path || "?"}`;
   }
   if (toolName === "exec_shell") {
@@ -238,6 +232,12 @@ function summarizeToolInput(toolName, input) {
   }
   if (toolName === "fetch_url") {
     return `${input.url || "?"}`;
+  }
+  if (toolName === "search_files" || toolName === "grep") {
+    return `"${input.pattern || ""}"`;
+  }
+  if (toolName === "move_file" || toolName === "copy_file") {
+    return `${input.from || "?"} → ${input.to || "?"}`;
   }
   const keys = Object.keys(input);
   return keys.length ? `{${keys.join(",")}}` : "";
@@ -252,8 +252,11 @@ export async function runAgent(task, {
   sessionId = "agent-" + Date.now(),
   signal,
   quiet = false,
+  onEvent,                    // 事件回调，供 UI 使用
+  workdir,                    // ★ 新增：指定工作目录
 } = {}) {
 
+  const emit = typeof onEvent === "function" ? onEvent : (() => {});
   const startedAt = Date.now();
 
   const checkAbort = () => {
@@ -264,28 +267,78 @@ export async function runAgent(task, {
     }
   };
 
-  // ★ 所有 chat 调用共用这个 opts，带上 signal
   const chatOpts = { site, sessionId, signal };
 
-  if (!quiet) {
-    console.log("");
-    console.log("╔═══════════════════════════════════════════════════╗");
-    console.log("║              🤖  AI Agent 启动                    ║");
-    console.log("╚═══════════════════════════════════════════════════╝");
-    console.log("");
-    console.log(`📋 任务: ${task}`);
-    console.log(`🔖 sessionId: ${sessionId}`);
-    console.log(`🖥️  环境: ${SYSTEM_INFO.platformName} (${SYSTEM_INFO.platform}) / ${SYSTEM_INFO.arch}`);
-    console.log(`📁 工作目录: ${SYSTEM_INFO.cwd}`);
-    console.log(`⏰ 开始时间: ${new Date().toLocaleString()}`);
-    console.log("");
+  // 统一的输出函数：console + emit
+  const logIcon = (icon, text) => {
+    if (!quiet) console.log(`  ${icon} ${text}`);
+    emit({ type: "log", icon, text });
+  };
+
+  const logHeader = (step, maxSteps) => {
+    if (!quiet) logStepHeader(step, maxSteps);
+    emit({ type: "step-start", step, maxSteps });
+  };
+
+  // ==========================================
+  // ★ workdir 处理
+  // ==========================================
+  const originalCwd = process.cwd();
+  const targetWorkdir = workdir ? path.resolve(workdir) : originalCwd;
+  let didChdir = false;
+
+  if (targetWorkdir !== originalCwd) {
+    try {
+      const stat = await fs.stat(targetWorkdir);
+      if (!stat.isDirectory()) {
+        throw new Error("不是目录");
+      }
+      process.chdir(targetWorkdir);
+      didChdir = true;
+      if (!quiet) {
+        console.log(`📂 切换工作目录: ${originalCwd} → ${targetWorkdir}`);
+      }
+      emit({ type: "workdir", from: originalCwd, to: targetWorkdir });
+    } catch (err) {
+      const result = {
+        ok: false,
+        reason: "workdir_invalid",
+        message: `工作目录无效: ${targetWorkdir} (${err.message})`,
+      };
+      if (!quiet) {
+        console.error(`❌ 工作目录无效: ${targetWorkdir} — ${err.message}`);
+      }
+      emit({ type: "done", ...result });
+      return result;
+    }
   }
 
-  checkAbort();
+  try {
+    // ★ 每次基于当前 cwd 生成 SYSTEM_PROMPT
+    const SYSTEM_PROMPT = buildSystemPrompt(process.cwd());
 
-  // 第 1 步
-  let reply = await chat(
-    `${SYSTEM_PROMPT}
+    if (!quiet) {
+      const info = collectSystemInfo(process.cwd());
+      console.log("");
+      console.log("╔═══════════════════════════════════════════════════╗");
+      console.log("║              🤖  AI Agent 启动                    ║");
+      console.log("╚═══════════════════════════════════════════════════╝");
+      console.log("");
+      console.log(`📋 任务: ${task}`);
+      console.log(`🔖 sessionId: ${sessionId}`);
+      console.log(`🖥️  环境: ${info.platformName} (${info.platform}) / ${info.arch}`);
+      console.log(`📁 工作目录: ${process.cwd()}`);
+      console.log(`⏰ 开始时间: ${new Date().toLocaleString()}`);
+      console.log("");
+    }
+
+    emit({ type: "started", task, sessionId, site, startedAt, workdir: process.cwd() });
+
+    checkAbort();
+
+    // 第 1 步
+    let reply = await chat(
+      `${SYSTEM_PROMPT}
 
 ---
 
@@ -300,22 +353,25 @@ export async function runAgent(task, {
 用户任务：${task}
 
 请直接输出第一个决策。不要解释，不要道歉，不要说你无法执行。`,
-    chatOpts
-  );
-  checkAbort();
+      chatOpts
+    );
+    checkAbort();
 
-  for (let step = 0; step < maxSteps; step++) {
-    logStepHeader(step + 1, maxSteps);
-    logSubIcon("🧠", "思考中...");
-    
-    let parsed = parseAgentOutput(reply);
+    for (let step = 0; step < maxSteps; step++) {
+      logHeader(step + 1, maxSteps);
+      logIcon("🧠", "思考中...");
+      emit({ type: "llm-reply", step: step + 1, raw: reply });
 
-    if (!parsed) {
-      logSubIcon("💬", `JSON 解析失败,文本: ${reply}`);
-	  logSubIcon("💬", "----------------------------");
-      logSubIcon("⚠️", "JSON 解析失败，让 LLM 重做...");
-      reply = await chat(
-        `你刚才的输出无法解析。请重新输出，严格遵守：
+      let parsed = parseAgentOutput(reply);
+
+      if (!parsed) {
+        if (!quiet) {
+          console.log(`  💬 JSON 解析失败,文本: ${reply}`);
+          console.log(`  💬 ----------------------------`);
+        }
+        logIcon("⚠️", "JSON 解析失败，让 LLM 重做...");
+        reply = await chat(
+          `你刚才的输出无法解析。请重新输出，严格遵守：
 1. 整段内容必须放在 \`\`\`agent ... \`\`\` 代码块里。
 2. 代码块内第一行是 JSON：{"thought":"...","action":"工具名","action_input":{...}}
 3. 如果 action 是 write_file，JSON 之后要用 <<<CONTENT>>> ... <<<END_CONTENT>>> 包裹文件内容。
@@ -324,93 +380,110 @@ export async function runAgent(task, {
 
 你刚才的输出是：
 ${reply.slice(0, 800)}`,
-        chatOpts
-      );
+          chatOpts
+        );
+        checkAbort();
+        logIcon("🔁", `LLM 重试: ${reply.slice(0, 200)}${reply.length > 200 ? "..." : ""}`);
+        parsed = parseAgentOutput(reply);
+      }
+
+      if (!parsed) {
+        logIcon("❌", "重试后仍解析失败");
+        if (!quiet) {
+          console.log("");
+          console.log("╔═══════════════════════════════════════════════════╗");
+          console.log("║  ❌  任务失败（解析错误）                          ║");
+          console.log("╚═══════════════════════════════════════════════════╝");
+        }
+        const result = { ok: false, reason: "parse_error", raw: reply };
+        emit({ type: "done", ...result });
+        return result;
+      }
+
+      if (parsed.final_answer) {
+        const elapsed = Date.now() - startedAt;
+        logIcon("🎉", `任务完成`);
+        if (!quiet) {
+          console.log("");
+          console.log("╔═══════════════════════════════════════════════════╗");
+          console.log("║  ✅  任务完成                                     ║");
+          console.log("╚═══════════════════════════════════════════════════╝");
+          console.log("");
+          console.log("📝 最终答案:");
+          console.log("─────────────────────────────────────────────────");
+          console.log(parsed.final_answer);
+          console.log("─────────────────────────────────────────────────");
+          console.log("");
+          console.log(`⏱️  总耗时: ${formatElapsed(elapsed)}`);
+          console.log(`📍 执行步数: ${step + 1} / ${maxSteps}`);
+          console.log("");
+        }
+        const result = { ok: true, answer: parsed.final_answer, elapsed, steps: step + 1 };
+        emit({ type: "done", ...result });
+        return result;
+      }
+
+      const toolName = parsed.action;
+      const toolInput = parsed.action_input || {};
+
+      if (!tools[toolName]) {
+        logIcon("⚠️", `未知工具: ${toolName}`);
+        reply = await chat(
+          `工具 "${toolName}" 不存在。可用工具只有：${Object.keys(tools).join(", ")}。请重新决策，只输出 \`\`\`agent 包裹的 JSON。写文件必须用 write_file。`,
+          chatOpts
+        );
+        checkAbort();
+        continue;
+      }
+
+      const inputSummary = summarizeToolInput(toolName, toolInput);
+      logIcon("🔧", `调用工具: ${toolName} ${inputSummary}`);
+      if (parsed.thought) {
+        logIcon("💭", `思考: ${parsed.thought}`);
+      }
+      emit({
+        type: "tool-call",
+        step: step + 1,
+        toolName,
+        input: toolInput,
+        thought: parsed.thought || "",
+      });
+
+      const toolStartedAt = Date.now();
+      let observation;
+      let toolSuccess = true;
+      try {
+        observation = await tools[toolName](toolInput);
+      } catch (err) {
+        observation = `工具执行失败: ${err.message}`;
+        toolSuccess = false;
+      }
+      const toolElapsed = Date.now() - toolStartedAt;
+      const truncated = String(observation).slice(0, 3000);
+
+      if (toolSuccess) {
+        logIcon("✅", `完成 (${formatElapsed(toolElapsed)}): ${truncated.slice(0, 100)}${truncated.length > 100 ? "..." : ""}`);
+      } else {
+        logIcon("❌", `失败 (${formatElapsed(toolElapsed)}): ${truncated.slice(0, 100)}`);
+      }
+      emit({
+        type: "tool-result",
+        step: step + 1,
+        toolName,
+        ok: toolSuccess,
+        elapsed: toolElapsed,
+        observation: truncated,
+      });
+
       checkAbort();
-      logSubIcon("🔁", `LLM 重试: ${reply.slice(0, 200)}${reply.length > 200 ? "..." : ""}`);
-      parsed = parseAgentOutput(reply);
-    }
 
-    if (!parsed) {
-      logSubIcon("❌", "重试后仍解析失败");
-      if (!quiet) {
-        console.log("");
-        console.log("╔═══════════════════════════════════════════════════╗");
-        console.log("║  ❌  任务失败（解析错误）                          ║");
-        console.log("╚═══════════════════════════════════════════════════╝");
-      }
-      return { ok: false, reason: "parse_error", raw: reply };
-    }
-
-    if (parsed.final_answer) {
-      const elapsed = Date.now() - startedAt;
-      logSubIcon("🎉", `任务完成`);
-      if (!quiet) {
-        console.log("");
-        console.log("╔═══════════════════════════════════════════════════╗");
-        console.log("║  ✅  任务完成                                     ║");
-        console.log("╚═══════════════════════════════════════════════════╝");
-      }
-      console.log("");
-      console.log("📝 最终答案:");
-      console.log("─────────────────────────────────────────────────");
-      console.log(parsed.final_answer);
-      console.log("─────────────────────────────────────────────────");
-      if (!quiet) {
-        console.log("");
-        console.log(`⏱️  总耗时: ${formatElapsed(elapsed)}`);
-        console.log(`📍 执行步数: ${step + 1} / ${maxSteps}`);
-        console.log("");
-      }
-      return { ok: true, answer: parsed.final_answer };
-    }
-
-    const toolName = parsed.action;
-    const toolInput = parsed.action_input || {};
-
-    if (!tools[toolName]) {
-      logSubIcon("⚠️", `未知工具: ${toolName}`);
-      reply = await chat(
-        `工具 "${toolName}" 不存在。可用工具只有：${Object.keys(tools).join(", ")}。请重新决策，只输出 \`\`\`agent 包裹的 JSON。写文件必须用 write_file。`,
-        chatOpts
-      );
-      checkAbort();
-      continue;
-    }
-
-    const inputSummary = summarizeToolInput(toolName, toolInput);
-    logSubIcon("🔧", `调用工具: ${toolName} ${inputSummary}`);
-    if (parsed.thought) {
-      logSubIcon("💭", `思考: ${parsed.thought}`);
-    }
-
-    const toolStartedAt = Date.now();
-    let observation;
-    let toolSuccess = true;
-    try {
-      observation = await tools[toolName](toolInput);
-    } catch (err) {
-      observation = `工具执行失败: ${err.message}`;
-      toolSuccess = false;
-    }
-    const toolElapsed = Date.now() - toolStartedAt;
-    const truncated = String(observation).slice(0, 3000);
-
-    if (toolSuccess) {
-      logSubIcon("✅", `完成 (${formatElapsed(toolElapsed)}): ${truncated.slice(0, 100)}${truncated.length > 100 ? "..." : ""}`);
-    } else {
-      logSubIcon("❌", `失败 (${formatElapsed(toolElapsed)}): ${truncated.slice(0, 100)}`);
-    }
-
-    checkAbort();
-
-    if (
-      toolName === "write_file" &&
-      /缺少 content|必须用 <<<CONTENT>>>/i.test(observation)
-    ) {
-      logSubIcon("🔁", "写文件缺少 CONTENT 块，让 LLM 重做");
-      reply = await chat(
-        `写入失败：${observation}
+      if (
+        toolName === "write_file" &&
+        /缺少 content|必须用 <<<CONTENT>>>/i.test(observation)
+      ) {
+        logIcon("🔁", "写文件缺少 CONTENT 块，让 LLM 重做");
+        reply = await chat(
+          `写入失败：${observation}
 
 请重新输出，格式必须是：
 
@@ -426,22 +499,35 @@ ${reply.slice(0, 800)}`,
 2. action_input 里只写 path，不要写 content。
 3. 文件内容放在 <<<CONTENT>>> ... <<<END_CONTENT>>> 之间，不要转义。
 4. 路径用正斜杠 /。`,
+          chatOpts
+        );
+        checkAbort();
+        continue;
+      }
+
+      logIcon("➡️", "继续下一步...");
+      reply = await chat(
+        `工具 ${toolName} 返回：\n\`\`\`\n${truncated}\n\`\`\`\n\n请继续思考下一步。记住：整段回复必须包在 \`\`\`agent 代码块里，路径用正斜杠 /。`,
         chatOpts
       );
       checkAbort();
-      continue;
     }
 
-    logSubIcon("➡️", "继续下一步...");
-    reply = await chat(
-      `工具 ${toolName} 返回：\n\`\`\`\n${truncated}\n\`\`\`\n\n请继续思考下一步。记住：整段回复必须包在 \`\`\`agent 代码块里，路径用正斜杠 /。`,
-      chatOpts
-    );
-    checkAbort();
+    console.error(`[agent] ❌ 超过最大步数 ${maxSteps}`);
+    const result = { ok: false, reason: "max_steps" };
+    emit({ type: "done", ...result });
+    return result;
+  } finally {
+    // ★ 恢复原 CWD
+    if (didChdir) {
+      try {
+        process.chdir(originalCwd);
+        if (!quiet) console.log(`📂 已恢复工作目录: ${originalCwd}`);
+      } catch (e) {
+        console.error(`恢复工作目录失败: ${e.message}`);
+      }
+    }
   }
-
-  console.error(`[agent] ❌ 超过最大步数 ${maxSteps}`);
-  return { ok: false, reason: "max_steps" };
 }
 
 // ==========================================
@@ -454,21 +540,16 @@ ${reply.slice(0, 800)}`,
 export function parseAgentOutput(text) {
   if (!text) return null;
 
-  // Step 0: 剥掉最外层代码块
   let body = text;
   const outer = text.match(/^\s*```(?:agent|json|plaintext|text|markdown)?\s*\n([\s\S]*?)\n```\s*$/);
   if (outer) {
     body = outer[1];
   }
 
-  // Step 1: 提取 CONTENT 块
   const { rawContent, cleanedText } = extractContentBlock(body);
-
-  // Step 2: 解析 JSON
   const parsed = parseJSONOnly(cleanedText);
   if (!parsed) return null;
 
-  // Step 3: 填充 content
   if (parsed.action === "write_file" && rawContent !== null) {
     if (!parsed.action_input) parsed.action_input = {};
     parsed.action_input.content = rawContent;
@@ -502,13 +583,9 @@ function extractContentBlock(text) {
  * 剥掉 ```lang ... ``` 外壳
  */
 function stripMarkdownCodeFence(content) {
-  // 情况1: 标准代码块
   const m = content.match(/^\s*(`{3,})[^\n]*\n([\s\S]*?)\n\1\s*$/);
-  if (m) {
-    return m[2];
-  }
+  if (m) return m[2];
 
-  // 情况2: 首行是纯语言名
   const LANG_RE = /^(python|py|javascript|js|typescript|ts|java|c\+\+|cpp|c#|csharp|go|golang|rust|ruby|php|swift|kotlin|bash|sh|shell|sql|html|css|json|xml|yaml|yml|markdown|md|text|plaintext|plain|c|cpp|agent)$/i;
   const lines = content.split("\n");
   if (lines.length >= 2 && LANG_RE.test(lines[0].trim())) {
@@ -527,9 +604,7 @@ function parseJSONOnly(text) {
   const codeMatches = [...text.matchAll(/```(?:json|agent)?\s*([\s\S]*?)```/g)];
   for (let i = codeMatches.length - 1; i >= 0; i--) {
     const obj = tryParseJSON(codeMatches[i][1].trim());
-    if (obj && isDecision(obj)) {
-      return obj;
-    }
+    if (obj && isDecision(obj)) return obj;
   }
 
   const found = extractLastJSON(text);
@@ -562,9 +637,7 @@ function extractLastJSON(text) {
 
     const candidate = text.slice(start, end + 1);
     const obj = tryParseJSON(candidate);
-    if (obj && isDecision(obj)) {
-      return obj;
-    }
+    if (obj && isDecision(obj)) return obj;
   }
   return null;
 }
