@@ -33,12 +33,29 @@ const sessionIdDisplayEl = $("#session-id-display");
 const topbarPathEl = $("#topbar-path");
 const topbarSessionEl = $("#topbar-session");
 
+// @ 候选浮层
+const atPopupEl = $("#at-popup");
+const atListEl = $("#at-list");
+
 // 项目模态框
 const projectModalEl = $("#project-modal");
 const projectNameInput = $("#project-name-input");
 const projectPathInput = $("#project-path-input");
 const projectCancelBtn = $("#project-cancel");
 const projectConfirmBtn = $("#project-confirm");
+
+// ==========================================
+// @ 候选状态
+// ==========================================
+const AT = {
+  visible: false,
+  entries: [],
+  selected: 0,
+  startPos: -1,     // 输入串里 "@" 的下标
+  endPos: -1,       // 输入串里 "@xxx" 的结束下标（= 光标位置）
+  query: "",
+  requestId: 0,
+};
 
 // ==========================================
 // 工具
@@ -69,8 +86,14 @@ function genSessionId() {
   return "s-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6);
 }
 
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+  return (bytes / 1024 / 1024).toFixed(1) + " MB";
+}
+
 // ==========================================
-// 顶栏
+// 顶栏 / 输入控制
 // ==========================================
 function updateTopbar() {
   const proj = state.projects.find(p => p.key === state.activeProjectKey);
@@ -84,9 +107,6 @@ function updateTopbar() {
   topbarSessionEl.textContent = state.activeSessionId || "";
 }
 
-// ==========================================
-// 输入启用/禁用
-// ==========================================
 function updateInputEnabled() {
   const canSend = !!state.activeProjectKey && !!state.activeSessionId;
   inputEl.disabled = !canSend;
@@ -94,7 +114,188 @@ function updateInputEnabled() {
 }
 
 // ==========================================
-// 项目列表渲染
+// @ 候选浮层
+// ==========================================
+
+/** 从光标位置向前找最近一个 @ 到光标的片段 */
+function getAtQuery() {
+  const value = inputEl.value;
+  const cursor = inputEl.selectionStart;
+  const before = value.slice(0, cursor);
+  // 匹配 @ 后跟非空白字符到光标
+  const m = before.match(/@([^\s@]*)$/);
+  if (!m) return null;
+  const startPos = cursor - m[0].length;
+  return {
+    startPos,
+    endPos: cursor,
+    query: m[1], // 不含 @
+  };
+}
+
+async function refreshAtCandidates() {
+  const q = getAtQuery();
+  if (!q) {
+    hideAtPopup();
+    return;
+  }
+  if (!state.activeProjectKey) {
+    hideAtPopup();
+    return;
+  }
+
+  AT.startPos = q.startPos;
+  AT.endPos = q.endPos;
+  AT.query = q.query;
+
+  // 拆出目录部分和基础部分
+  const slash = q.query.lastIndexOf("/");
+  const dir = slash >= 0 ? q.query.slice(0, slash) : "";
+  const base = slash >= 0 ? q.query.slice(slash + 1) : q.query;
+
+  AT.requestId++;
+  const myReq = AT.requestId;
+
+  try {
+    const url = `/api/browse?projectKey=${encodeURIComponent(state.activeProjectKey)}&dir=${encodeURIComponent(dir)}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      hideAtPopup();
+      return;
+    }
+    if (myReq !== AT.requestId) return; // 有更新请求先返回了
+
+    const data = await res.json();
+    let entries = data.entries || [];
+
+    // 前端按 base 前缀过滤（后端也可以做，这里更方便）
+    if (base) {
+      const lower = base.toLowerCase();
+      entries = entries.filter(e => e.name.toLowerCase().startsWith(lower));
+    }
+
+    if (entries.length === 0) {
+      hideAtPopup();
+      return;
+    }
+
+    AT.entries = entries;
+    AT.selected = 0;
+    AT.visible = true;
+    renderAtPopup();
+  } catch {
+    hideAtPopup();
+  }
+}
+
+function renderAtPopup() {
+  atListEl.innerHTML = "";
+  AT.entries.forEach((e, i) => {
+    const li = document.createElement("li");
+    li.className = "at-item" + (i === AT.selected ? " selected" : "");
+    li.dataset.idx = i;
+
+    const icon = e.isDir ? "📁" : "📄";
+    const sizeStr = e.isDir ? "" : formatSize(e.size || 0);
+
+    li.innerHTML = `
+      <span class="at-item-icon">${icon}</span>
+      <span class="at-item-name">${escapeHtml(e.name)}${e.isDir ? "/" : ""}</span>
+      ${sizeStr ? `<span class="at-item-size">${sizeStr}</span>` : ""}
+    `;
+
+    li.addEventListener("mousedown", (ev) => {
+      // mousedown 优先于 blur，避免点一下 textarea 失焦再处理
+      ev.preventDefault();
+      AT.selected = i;
+      applyAtCandidate();
+    });
+    li.addEventListener("mouseenter", () => {
+      AT.selected = i;
+      renderAtPopup();
+    });
+
+    atListEl.appendChild(li);
+  });
+
+  // 滚动到选中项
+  const selectedEl = atListEl.querySelector(".selected");
+  if (selectedEl) {
+    selectedEl.scrollIntoView({ block: "nearest" });
+  }
+
+  atPopupEl.style.display = "flex";
+}
+
+function hideAtPopup() {
+  AT.visible = false;
+  AT.entries = [];
+  AT.selected = 0;
+  atPopupEl.style.display = "none";
+}
+
+function applyAtCandidate() {
+  const item = AT.entries[AT.selected];
+  if (!item) return;
+
+  const value = inputEl.value;
+  const before = value.slice(0, AT.startPos);
+  const after = value.slice(AT.endPos);
+
+  let insert;
+  if (item.isDir) {
+    // 目录：替换为 @dir/ 后继续触发候选
+    insert = "@" + item.relPath;
+    const newValue = before + insert + after;
+    inputEl.value = newValue;
+    const newCursor = before.length + insert.length;
+    inputEl.setSelectionRange(newCursor, newCursor);
+    // 刷新候选
+    refreshAtCandidates();
+  } else {
+    // 文件：替换为 @file 后加空格
+    insert = "@" + item.relPath + " ";
+    const newValue = before + insert + after;
+    inputEl.value = newValue;
+    const newCursor = before.length + insert.length;
+    inputEl.setSelectionRange(newCursor, newCursor);
+    hideAtPopup();
+  }
+
+  autoGrow();
+  inputEl.focus();
+}
+
+function atPopupKeyHandler(e) {
+  if (!AT.visible) return false;
+
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    AT.selected = Math.min(AT.entries.length - 1, AT.selected + 1);
+    renderAtPopup();
+    return true;
+  }
+  if (e.key === "ArrowUp") {
+    e.preventDefault();
+    AT.selected = Math.max(0, AT.selected - 1);
+    renderAtPopup();
+    return true;
+  }
+  if (e.key === "Enter" || e.key === "Tab") {
+    e.preventDefault();
+    applyAtCandidate();
+    return true;
+  }
+  if (e.key === "Escape") {
+    e.preventDefault();
+    hideAtPopup();
+    return true;
+  }
+  return false;
+}
+
+// ==========================================
+// 项目列表
 // ==========================================
 async function loadProjects() {
   try {
@@ -170,7 +371,6 @@ function renderProjects() {
 
     projectListEl.appendChild(li);
 
-    // 如果展开，加载会话
     if (state.expandedProjects.has(proj.key)) {
       loadSessionsInto(li.querySelector(".session-sublist"), proj.key);
     }
@@ -232,7 +432,7 @@ function toggleProject(key) {
 }
 
 // ==========================================
-// 创建项目
+// 创建项目 / 会话
 // ==========================================
 function openProjectModal() {
   if (state.busy) return;
@@ -267,7 +467,6 @@ async function confirmCreateProject() {
 
     closeProjectModal();
 
-    // ★ 直接选中服务端返回的第一个会话
     state.expandedProjects.add(data.project.key);
     state.activeProjectKey = data.project.key;
     if (data.firstSession) {
@@ -286,9 +485,6 @@ async function confirmCreateProject() {
   }
 }
 
-// ==========================================
-// 创建会话
-// ==========================================
 async function createSession(projectKey) {
   if (state.busy) {
     console.warn("[createSession] busy, 跳过");
@@ -303,13 +499,9 @@ async function createSession(projectKey) {
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
-      const msg = data.error || `HTTP ${res.status}`;
-      console.error("[createSession] 失败:", msg);
-      setStatus("创建会话失败: " + msg, "error");
+      setStatus("创建会话失败: " + (data.error || res.status), "error");
       return;
     }
-    const data = await res.json();
-    console.log("[createSession] 成功:", data.session);
     state.activeProjectKey = projectKey;
     state.activeSessionId = sessionId;
     state.expandedProjects.add(projectKey);
@@ -320,14 +512,10 @@ async function createSession(projectKey) {
     setStatus("新会话已创建");
     inputEl.focus();
   } catch (e) {
-    console.error("[createSession] 异常:", e);
     setStatus("创建失败: " + e.message, "error");
   }
 }
 
-// ==========================================
-// 选择会话
-// ==========================================
 function selectSession(projectKey, sessionId, sessionData) {
   if (state.busy) return;
   state.activeProjectKey = projectKey;
@@ -339,7 +527,6 @@ function selectSession(projectKey, sessionId, sessionData) {
   updateTopbar();
   updateInputEnabled();
 
-  // 恢复历史
   messagesEl.innerHTML = "";
   const th = sessionData?.taskHistory || [];
   if (th.length === 0) {
@@ -468,6 +655,8 @@ async function sendTask() {
   if (state.busy) return;
   if (!state.activeProjectKey || !state.activeSessionId) return;
 
+  hideAtPopup();
+
   inputEl.value = "";
   inputEl.style.height = "auto";
   appendUserMessage(task);
@@ -537,15 +726,8 @@ async function sendTask() {
     updateInputEnabled();
     setStatus("就绪");
     inputEl.focus();
-    // 刷新会话列表（更新任务数）
     await loadProjects();
-    // 刷新当前项目的会话列表
-    const proj = state.activeProjectKey;
-    if (proj) {
-      const el = projectListEl.querySelector(`[data-key="${proj}"] .session-sublist`);
-      // 简单方式：重新渲染
-      renderProjects();
-    }
+    renderProjects();
   }
 }
 
@@ -554,7 +736,15 @@ function handleAgentEvent(e, ref) {
     ref.current = null;
     return;
   }
-  if (e.type === "workdir") return;   // 前端不需要展示 workdir（已在顶栏显示）
+   // ★ 新增：显示附件摘要
+  if (e.type === "attachments") {
+    const okCount = e.attachments.filter(a => !a.error).length;
+    const errCount = e.attachments.length - okCount;
+    const text = `📎 引用 ${okCount} 个文件` + (errCount ? `（${errCount} 个失败）` : "");
+    setStatus(text);
+    return;
+  }
+  if (e.type === "workdir") return;
   if (e.type === "step-start") {
     if (ref.current) finishStepCard(ref.current);
     ref.current = createStepCard(e.step, e.maxSteps);
@@ -616,6 +806,14 @@ async function stopTask() {
 }
 
 // ==========================================
+// textarea 自适应高度
+// ==========================================
+function autoGrow() {
+  inputEl.style.height = "auto";
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + "px";
+}
+
+// ==========================================
 // 事件绑定
 // ==========================================
 btnSend.onclick = sendTask;
@@ -641,16 +839,30 @@ projectPathInput.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closeProjectModal();
 });
 
+// ★ textarea：监听输入、光标变化、键盘
+inputEl.addEventListener("input", () => {
+  autoGrow();
+  refreshAtCandidates();
+});
+
+inputEl.addEventListener("click", () => {
+  refreshAtCandidates();
+});
+
+inputEl.addEventListener("blur", () => {
+  // 延迟一点，让 mousedown 有机会处理
+  setTimeout(() => hideAtPopup(), 150);
+});
+
 inputEl.addEventListener("keydown", (e) => {
+  // 候选浮层优先
+  if (atPopupKeyHandler(e)) return;
+
+  // Ctrl+Enter 发送
   if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
     e.preventDefault();
     sendTask();
   }
-});
-
-inputEl.addEventListener("input", () => {
-  inputEl.style.height = "auto";
-  inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + "px";
 });
 
 siteSelectEl.onchange = () => {
@@ -665,8 +877,6 @@ async function init() {
   updateInputEnabled();
   updateTopbar();
   await loadProjects();
-
-  // 每 15 秒刷新项目
   setInterval(loadProjects, 15000);
 }
 

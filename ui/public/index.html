@@ -42,7 +42,6 @@
     </aside>
 
     <main class="main">
-      <!-- 顶部：当前项目路径 -->
       <div class="topbar" id="topbar">
         <div class="topbar-left">
           <span class="topbar-icon">📁</span>
@@ -65,10 +64,19 @@
         <div class="input-wrapper">
           <textarea
             id="task-input"
-            placeholder="输入消息... Ctrl+Enter 发送"
+            placeholder="输入消息... 输入 @ 引用文件，Ctrl+Enter 发送"
             rows="1"
             disabled
           ></textarea>
+
+          <!-- ★ @ 文件候选浮层 -->
+          <div id="at-popup" class="at-popup" style="display:none;">
+            <ul id="at-list" class="at-list"></ul>
+            <div class="at-hint">
+              ↑↓ 选择 · Enter/Tab 确认 · Esc 关闭
+            </div>
+          </div>
+
           <div class="input-actions">
             <button id="btn-stop" class="btn-stop" style="display:none;">⏹ 停止</button>
             <button id="btn-send" class="btn-send" disabled>发送</button>

@@ -1,21 +1,23 @@
 #!/usr/bin/env node
 // ==========================================
 // agent/cli.js
-// 交互式命令行 AI Agent（项目/会话 + 多行 + abort）
+// 交互式命令行 AI Agent（内联 @ 候选 + 项目/会话）
 // ==========================================
-import readline from "readline";
 import fs from "fs/promises";
+import { readdirSync } from "fs";
 import os from "os";
 import path from "path";
 import crypto from "crypto";
 import { runAgent } from "./agent.js";
+import { InlinePrompt } from "./input.js";
 
 // ==========================================
 // 常量
 // ==========================================
 const SERVER_URL = "http://127.0.0.1:8787";
 const PROJECTS_DIR = path.join(os.homedir(), ".ai-bridge-agent", "projects");
-const DEBOUNCE_MS = 300;
+const MAX_FILE_SIZE = 200 * 1024;
+const MAX_TOTAL_SIZE = 500 * 1024;
 
 // ==========================================
 // 全局状态
@@ -26,8 +28,8 @@ const STATE = {
   url: null,
   createdAt: new Date().toISOString(),
   savedName: null,
-  projectKey: null,       // ★ 当前项目 key
-  workdir: null,          // ★ 由 project 决定
+  projectKey: null,
+  workdir: null,
   busy: false,
   cancelling: false,
   currentAbort: null,
@@ -35,33 +37,15 @@ const STATE = {
   taskCount: 0,
   startedAt: Date.now(),
   lastSessionList: [],
-  lastProjectList: [],
 };
 
 // ==========================================
-// 输入缓冲
-// ==========================================
-const INPUT = {
-  buffer: [],
-  timer: null,
-  multilineMode: false,
-  processing: false,
-};
-
-// ==========================================
-// ANSI 颜色
+// 颜色
 // ==========================================
 const C = {
-  reset: "\x1b[0m",
-  bold: "\x1b[1m",
-  dim: "\x1b[2m",
-  red: "\x1b[31m",
-  green: "\x1b[32m",
-  yellow: "\x1b[33m",
-  blue: "\x1b[34m",
-  magenta: "\x1b[35m",
-  cyan: "\x1b[36m",
-  gray: "\x1b[90m",
+  reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m",
+  red: "\x1b[31m", green: "\x1b[32m", yellow: "\x1b[33m",
+  blue: "\x1b[34m", magenta: "\x1b[35m", cyan: "\x1b[36m", gray: "\x1b[90m",
 };
 const c = (color, text) => `${C[color]}${text}${C.reset}`;
 
@@ -93,15 +77,9 @@ function extractUuidFromUrl(url) {
 // ==========================================
 // 项目存储
 // ==========================================
-function getProjectDir(key) {
-  return path.join(PROJECTS_DIR, key);
-}
-function getProjectMetaPath(key) {
-  return path.join(getProjectDir(key), "project.json");
-}
-function getSessionsDir(key) {
-  return path.join(getProjectDir(key), "sessions");
-}
+function getProjectDir(key) { return path.join(PROJECTS_DIR, key); }
+function getProjectMetaPath(key) { return path.join(getProjectDir(key), "project.json"); }
+function getSessionsDir(key) { return path.join(getProjectDir(key), "sessions"); }
 
 async function readProject(key) {
   return JSON.parse(await fs.readFile(getProjectMetaPath(key), "utf-8"));
@@ -119,80 +97,38 @@ async function listProjects() {
   for (const e of entries) {
     if (!e.isDirectory()) continue;
     try {
-      const meta = JSON.parse(await fs.readFile(getProjectMetaPath(e.name), "utf-8"));
-      result.push(meta);
+      result.push(JSON.parse(await fs.readFile(getProjectMetaPath(e.name), "utf-8")));
     } catch {}
   }
   result.sort((a, b) => (b.lastUsedAt || "").localeCompare(a.lastUsedAt || ""));
   return result;
 }
 
-async function ensureProject(key, workdir) {
-  const dir = getProjectDir(key);
-  await fs.mkdir(path.join(dir, "sessions"), { recursive: true });
-  const metaPath = getProjectMetaPath(key);
-  try {
-    const meta = JSON.parse(await fs.readFile(metaPath, "utf-8"));
-    meta.lastUsedAt = new Date().toISOString();
-    await fs.writeFile(metaPath, JSON.stringify(meta, null, 2), "utf-8");
-    return meta;
-  } catch {
-    const now = new Date().toISOString();
-    const meta = {
-      name: key,
-      key,
-      path: workdir,
-      createdAt: now,
-      lastUsedAt: now,
-    };
-    await fs.writeFile(metaPath, JSON.stringify(meta, null, 2), "utf-8");
-    return meta;
-  }
-}
-
-// 从 cwd 派生项目：basename，冲突则加 hash
 async function findOrCreateProjectForCwd(cwd) {
   const abs = path.resolve(cwd);
   const base = sanitizeName(path.basename(abs) || "default");
-
-  // 1) 尝试 base
   try {
     const meta = JSON.parse(await fs.readFile(getProjectMetaPath(base), "utf-8"));
     if (path.resolve(meta.path) === abs) {
-      // path 一致，直接复用
       meta.lastUsedAt = new Date().toISOString();
       await writeProject(base, meta);
       return { key: base, meta };
     }
-    // path 不一致 → 用 base-hash
     const hash = crypto.createHash("md5").update(abs).digest("hex").slice(0, 6);
-    const keyWithHash = `${base}-${hash}`;
+    const kh = `${base}-${hash}`;
     try {
-      const meta2 = JSON.parse(await fs.readFile(getProjectMetaPath(keyWithHash), "utf-8"));
-      return { key: keyWithHash, meta: meta2 };
+      const m2 = JSON.parse(await fs.readFile(getProjectMetaPath(kh), "utf-8"));
+      return { key: kh, meta: m2 };
     } catch {
       const now = new Date().toISOString();
-      const m = {
-        name: base,
-        key: keyWithHash,
-        path: abs,
-        createdAt: now,
-        lastUsedAt: now,
-      };
-      await fs.mkdir(getSessionsDir(keyWithHash), { recursive: true });
-      await writeProject(keyWithHash, m);
-      return { key: keyWithHash, meta: m };
+      const m = { name: base, key: kh, path: abs, createdAt: now, lastUsedAt: now };
+      await fs.mkdir(getSessionsDir(kh), { recursive: true });
+      await writeProject(kh, m);
+      return { key: kh, meta: m };
     }
   } catch {
-    // base 不存在，直接创建
     const now = new Date().toISOString();
-    const m = {
-      name: base,
-      key: base,
-      path: abs,
-      createdAt: now,
-      lastUsedAt: now,
-    };
+    const m = { name: base, key: base, path: abs, createdAt: now, lastUsedAt: now };
     await fs.mkdir(getSessionsDir(base), { recursive: true });
     await writeProject(base, m);
     return { key: base, meta: m };
@@ -200,7 +136,7 @@ async function findOrCreateProjectForCwd(cwd) {
 }
 
 // ==========================================
-// 会话存储（基于项目）
+// 会话存储
 // ==========================================
 async function listProjectSessions(key) {
   await fs.mkdir(getSessionsDir(key), { recursive: true });
@@ -209,8 +145,7 @@ async function listProjectSessions(key) {
   for (const f of files) {
     if (!f.endsWith(".json")) continue;
     try {
-      const content = await fs.readFile(path.join(getSessionsDir(key), f), "utf-8");
-      result.push(JSON.parse(content));
+      result.push(JSON.parse(await fs.readFile(path.join(getSessionsDir(key), f), "utf-8")));
     } catch {}
   }
   result.sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
@@ -218,8 +153,8 @@ async function listProjectSessions(key) {
 }
 
 async function readSessionFile(key, name) {
-  const p = path.join(getSessionsDir(key), `${sanitizeName(name)}.json`);
-  return JSON.parse(await fs.readFile(p, "utf-8"));
+  return JSON.parse(await fs.readFile(
+    path.join(getSessionsDir(key), `${sanitizeName(name)}.json`), "utf-8"));
 }
 
 async function writeSessionFile(key, name, data) {
@@ -230,8 +165,7 @@ async function writeSessionFile(key, name, data) {
 }
 
 async function deleteSessionFile(key, name) {
-  const p = path.join(getSessionsDir(key), `${sanitizeName(name)}.json`);
-  await fs.unlink(p);
+  await fs.unlink(path.join(getSessionsDir(key), `${sanitizeName(name)}.json`));
 }
 
 // ==========================================
@@ -250,13 +184,9 @@ async function refreshUrlFromServer() {
   } catch {}
 }
 
-// ==========================================
-// 保存/加载（基于项目）
-// ==========================================
 async function saveSessionToDisk(name) {
   await refreshUrlFromServer();
-
-  const data = {
+  return await writeSessionFile(STATE.projectKey, name, {
     sessionId: STATE.sessionId,
     site: STATE.site,
     url: STATE.url,
@@ -264,9 +194,68 @@ async function saveSessionToDisk(name) {
     updatedAt: new Date().toISOString(),
     taskCount: STATE.taskCount,
     taskHistory: STATE.taskHistory.slice(-50),
-  };
+  });
+}
 
-  return await writeSessionFile(STATE.projectKey, name, data);
+// ==========================================
+// @ 引用
+// ==========================================
+function parseFileReferences(text) {
+  const regex = /@(?:"([^"]+)"|([^\s@]+))/g;
+  const refs = [];
+  let m;
+  while ((m = regex.exec(text)) !== null) {
+    const p = m[1] !== undefined ? m[1] : m[2];
+    if (p) refs.push({ full: m[0], path: p });
+  }
+  return refs;
+}
+
+async function loadReferencedFiles(text) {
+  const refs = parseFileReferences(text);
+  if (refs.length === 0) return [];
+
+  const results = [];
+  let totalSize = 0;
+  const BINARY = new Set([
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp",
+    ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".wav",
+    ".zip", ".rar", ".7z", ".tar", ".gz",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".exe", ".dll", ".so", ".dylib", ".bin",
+    ".woff", ".woff2", ".ttf", ".otf",
+    ".class", ".jar", ".pyc",
+  ]);
+
+  for (const ref of refs) {
+    const abs = path.isAbsolute(ref.path) ? ref.path : path.resolve(STATE.workdir, ref.path);
+    try {
+      const stat = await fs.stat(abs);
+      if (!stat.isFile()) { results.push({ path: ref.path, abs, error: "不是文件" }); continue; }
+      if (stat.size > MAX_FILE_SIZE) {
+        results.push({ path: ref.path, abs, error: `文件过大` }); continue;
+      }
+      if (totalSize + stat.size > MAX_TOTAL_SIZE) {
+        results.push({ path: ref.path, abs, error: `超出总限制` }); continue;
+      }
+      if (BINARY.has(path.extname(abs).toLowerCase())) {
+        results.push({ path: ref.path, abs, error: "二进制" }); continue;
+      }
+      const content = await fs.readFile(abs, "utf-8");
+      totalSize += stat.size;
+      results.push({ path: ref.path, abs, content, size: stat.size });
+    } catch (e) {
+      results.push({ path: ref.path, abs, error: e.message });
+    }
+  }
+  return results;
+}
+
+function buildTaskWithAttachments(task, atts) {
+  const ok = atts.filter(a => a.content !== undefined);
+  if (ok.length === 0) return task;
+  const parts = ok.map(a => `### @${a.path}\n\n\`\`\`\n${a.content}\n\`\`\``);
+  return `${task}\n\n---\n\n【引用的文件】\n\n${parts.join("\n\n")}`;
 }
 
 // ==========================================
@@ -282,78 +271,61 @@ function printBanner() {
   console.log(`  工作目录:  ${c("gray", STATE.workdir)}`);
   console.log(`  站点:      ${c("yellow", STATE.site)}`);
   console.log(`  会话 ID:   ${c("gray", STATE.sessionId)}`);
-  if (STATE.url) {
-    console.log(`  网页 URL:  ${c("gray", STATE.url)}`);
-  }
-  if (STATE.savedName) {
-    console.log(`  已保存为:  ${c("green", STATE.savedName)}`);
-  }
+  if (STATE.url) console.log(`  网页 URL:  ${c("gray", STATE.url)}`);
+  if (STATE.savedName) console.log(`  已保存为:  ${c("green", STATE.savedName)}`);
   console.log("");
   console.log(c("gray", "  输入 /help 查看帮助  ·  Ctrl+C 取消任务/退出"));
-  console.log(c("gray", "  粘贴多行后按回车确认发送"));
+  console.log(c("gray", "  输入 @ 触发文件候选浮层"));
   console.log("");
 }
 
 function printHelp() {
   console.log("");
-  console.log(c("cyan", "📖 可用命令:"));
+  console.log(c("cyan", "📖 命令:"));
   console.log("");
-  console.log(c("bold", "  基础:"));
-  console.log(`    ${c("yellow", "/help")}                显示此帮助`);
-  console.log(`    ${c("yellow", "/exit")} ${c("gray", "或")} ${c("yellow", "/quit")}       退出`);
-  console.log(`    ${c("yellow", "/clear")}               清屏`);
-  console.log(`    ${c("yellow", "/status")}              显示当前状态`);
-  console.log(`    ${c("yellow", "/history")}             显示任务历史`);
+  console.log(`  ${c("yellow", "/help")}        显示帮助`);
+  console.log(`  ${c("yellow", "/exit")}        退出`);
+  console.log(`  ${c("yellow", "/clear")}       清屏`);
+  console.log(`  ${c("yellow", "/new")}         新会话`);
+  console.log(`  ${c("yellow", "/save")}        保存会话`);
+  console.log(`  ${c("yellow", "/load")}        加载会话`);
+  console.log(`  ${c("yellow", "/sessions")}    列出会话`);
+  console.log(`  ${c("yellow", "/projects")}    列出项目`);
+  console.log(`  ${c("yellow", "/project")}     切换项目`);
+  console.log(`  ${c("yellow", "/site")}        切换站点`);
+  console.log(`  ${c("yellow", "/status")}      当前状态`);
+  console.log(`  ${c("yellow", "/history")}     任务历史`);
   console.log("");
-  console.log(c("bold", "  会话:"));
-  console.log(`    ${c("yellow", "/new")}                 开始新会话`);
-  console.log(`    ${c("yellow", "/site <name>")}         切换站点`);
-  console.log(`    ${c("yellow", "/sites")}               列出支持的站点`);
-  console.log("");
-  console.log(c("bold", "  项目:"));
-  console.log(`    ${c("yellow", "/projects")}            列出所有项目`);
-  console.log(`    ${c("yellow", "/project")}             显示当前项目`);
-  console.log(`    ${c("yellow", "/project <key>")}       切换到指定项目`);
-  console.log("");
-  console.log(c("bold", "  保存/恢复（当前项目下）:"));
-  console.log(`    ${c("yellow", "/save [name]")}         保存会话（不带 name → 用 URL 的 UUID）`);
-  console.log(`    ${c("yellow", "/sessions")}            列出当前项目的会话`);
-  console.log(`    ${c("yellow", "/load")}                列出会话`);
-  console.log(`    ${c("yellow", "/load <编号>")}         按编号加载，如 /load 1`);
-  console.log(`    ${c("yellow", "/load <name>")}         按名字加载`);
-  console.log(`    ${c("yellow", "/unsave <name>")}       删除会话`);
-  console.log("");
-  console.log(c("gray", `  项目根目录: ${PROJECTS_DIR}`));
+  console.log(c("cyan", "⌨️  快捷键:"));
+  console.log(`  ${c("yellow", "@")}           触发文件候选`);
+  console.log(`  ${c("yellow", "↑↓")}          候选选择 / 输入历史`);
+  console.log(`  ${c("yellow", "Tab/Enter")}   应用候选`);
+  console.log(`  ${c("yellow", "Esc")}         关闭候选 / 清空输入`);
+  console.log(`  ${c("yellow", "Ctrl+C")}      取消任务 / 退出`);
+  console.log(`  ${c("yellow", "Ctrl+U")}      清空当前行`);
+  console.log(`  ${c("yellow", "Ctrl+W")}      删一个词`);
   console.log("");
 }
 
 function printSites() {
   console.log("");
   console.log(c("cyan", "🌐 支持的站点:"));
-  console.log("");
   ["chatgpt", "deepseek", "claude", "gemini", "kimi"].forEach(s => {
-    const marker = s === STATE.site ? c("green", "  ← 当前") : "";
-    console.log(`  - ${c("yellow", s)}${marker}`);
+    const m = s === STATE.site ? c("green", "  ← 当前") : "";
+    console.log(`  - ${c("yellow", s)}${m}`);
   });
   console.log("");
 }
 
 function printStatus() {
   console.log("");
-  console.log(c("cyan", "📊 当前状态:"));
-  console.log("");
+  console.log(c("cyan", "📊 状态:"));
   console.log(`  项目:       ${c("yellow", STATE.projectKey)}`);
   console.log(`  工作目录:   ${c("gray", STATE.workdir)}`);
   console.log(`  站点:       ${c("yellow", STATE.site)}`);
   console.log(`  会话 ID:    ${c("gray", STATE.sessionId)}`);
-  if (STATE.url) {
-    console.log(`  网页 URL:   ${c("gray", STATE.url)}`);
-  } else {
-    console.log(`  网页 URL:   ${c("gray", "(尚未生成)")}`);
-  }
-  if (STATE.savedName) {
-    console.log(`  已保存为:   ${c("green", STATE.savedName)}`);
-  }
+  if (STATE.url) console.log(`  网页 URL:   ${c("gray", STATE.url)}`);
+  if (STATE.savedName) console.log(`  已保存为:   ${c("green", STATE.savedName)}`);
   console.log(`  任务数:     ${STATE.taskCount}`);
   console.log(`  运行时长:   ${formatElapsed(Date.now() - STATE.startedAt)}`);
   console.log("");
@@ -362,25 +334,21 @@ function printStatus() {
 function printHistory() {
   console.log("");
   if (STATE.taskHistory.length === 0) {
-    console.log(c("gray", "  (暂无任务历史)"));
-    console.log("");
+    console.log(c("gray", "  (暂无历史)"));
     return;
   }
-  console.log(c("cyan", `📜 任务历史 (${STATE.taskHistory.length}):`));
-  console.log("");
+  console.log(c("cyan", `📜 历史 (${STATE.taskHistory.length}):`));
   STATE.taskHistory.forEach((h, i) => {
     const icon = h.ok ? c("green", "✅") : c("red", "❌");
-    const time = c("gray", formatElapsed(h.elapsed));
-    const firstLine = h.task.split("\n")[0];
-    const task = firstLine.length > 50 ? firstLine.slice(0, 47) + "..." : firstLine;
-    const extra = h.task.includes("\n") ? c("gray", ` [${h.task.split("\n").length}行]`) : "";
-    console.log(`  ${i + 1}. ${icon} ${task}${extra}  ${time}`);
+    const first = h.task.split("\n")[0];
+    const task = first.length > 60 ? first.slice(0, 57) + "..." : first;
+    console.log(`  ${i + 1}. ${icon} ${task}  ${c("gray", formatElapsed(h.elapsed))}`);
   });
   console.log("");
 }
 
 // ==========================================
-// 命令处理
+// 命令
 // ==========================================
 async function handleCommand(input) {
   const parts = input.trim().split(/\s+/);
@@ -389,30 +357,21 @@ async function handleCommand(input) {
 
   switch (cmd) {
     case "/help": case "/h": case "/?":
-      printHelp();
-      break;
-
+      printHelp(); break;
     case "/exit": case "/quit": case "/q":
       if (STATE.savedName) {
         try {
           await saveSessionToDisk(STATE.savedName);
-          console.log("");
-          console.log(c("green", `  💾 已自动保存会话: ${STATE.savedName}`));
-        } catch (e) {
-          console.log(c("yellow", `  ⚠️ 自动保存失败: ${e.message}`));
-        }
+          console.log(c("green", `  💾 已保存: ${STATE.savedName}`));
+        } catch {}
       }
       console.log("");
       console.log(c("cyan", "  👋 再见！"));
-      console.log("");
       process.exit(0);
-      break;
-
     case "/clear":
       console.clear();
       printBanner();
       break;
-
     case "/new":
       STATE.sessionId = newSessionId();
       STATE.url = null;
@@ -421,119 +380,53 @@ async function handleCommand(input) {
       STATE.taskHistory = [];
       STATE.taskCount = 0;
       STATE.startedAt = Date.now();
-      console.log("");
       console.log(c("green", `  ✅ 新会话: ${STATE.sessionId}`));
-      console.log(c("gray", "  (尚未保存，用 /save 保存)"));
-      console.log("");
       break;
-
     case "/site":
-      if (args.length === 0) {
-        console.log("");
-        console.log(c("yellow", `  当前站点: ${STATE.site}`));
-        console.log(c("gray", "  用法: /site <name>"));
-        console.log("");
-      } else {
-        STATE.site = args[0];
-        console.log("");
-        console.log(c("green", `  ✅ 已切换到站点: ${STATE.site}`));
-        console.log("");
-      }
+      if (!args[0]) { console.log(c("yellow", `  当前: ${STATE.site}`)); }
+      else { STATE.site = args[0]; console.log(c("green", `  ✅ 站点: ${STATE.site}`)); }
       break;
-
-    case "/sites":
-      printSites();
-      break;
-
-    case "/status":
-      printStatus();
-      break;
-
-    case "/history":
-      printHistory();
-      break;
-
-    case "/save":
-      await handleSave(args[0]);
-      break;
-
-    case "/load":
-      await handleLoad(args[0]);
-      break;
-
-    case "/sessions":
-      await handleListSessions();
-      break;
-
-    case "/unsave":
-      await handleUnsave(args[0]);
-      break;
-
-    case "/projects":
-      await handleListProjects();
-      break;
-
-    case "/project":
-      await handleProject(args[0]);
-      break;
-
+    case "/sites": printSites(); break;
+    case "/status": printStatus(); break;
+    case "/history": printHistory(); break;
+    case "/save": await handleSave(args[0]); break;
+    case "/load": await handleLoad(args[0]); break;
+    case "/sessions": await handleListSessions(); break;
+    case "/unsave": await handleUnsave(args[0]); break;
+    case "/projects": await handleListProjects(); break;
+    case "/project": await handleProject(args[0]); break;
     default:
-      console.log("");
       console.log(c("red", `  ⚠️ 未知命令: ${cmd}`));
-      console.log(c("gray", "  输入 /help 查看可用命令"));
-      console.log("");
   }
 }
 
-// ==========================================
-// 项目命令
-// ==========================================
 async function handleListProjects() {
   try {
     const list = await listProjects();
-    STATE.lastProjectList = list;
     console.log("");
-    if (list.length === 0) {
-      console.log(c("gray", "  (暂无项目)"));
-      console.log("");
-      return;
-    }
-    console.log(c("cyan", `📂 项目列表 (${list.length}):`));
-    console.log("");
+    if (list.length === 0) { console.log(c("gray", "  (暂无项目)")); return; }
+    console.log(c("cyan", `📂 项目 (${list.length}):`));
     list.forEach((p, i) => {
-      const isCurrent = p.key === STATE.projectKey;
-      const marker = isCurrent ? c("green", " ← 当前") : "";
-      console.log(`  ${c("yellow", `[${i + 1}]`)} ${p.key}${marker}`);
-      console.log(c("gray", `      path: ${p.path}`));
-      console.log(c("gray", `      更新: ${(p.lastUsedAt || "-").slice(0, 19)}`));
+      const m = p.key === STATE.projectKey ? c("green", " ← 当前") : "";
+      console.log(`  [${i + 1}] ${p.key}${m}  ${c("gray", p.path)}`);
     });
     console.log("");
-    console.log(c("gray", "  用 /project <key> 切换"));
-    console.log("");
-  } catch (e) {
-    console.log(c("red", `  ❌ ${e.message}`));
-  }
+  } catch (e) { console.log(c("red", `  ❌ ${e.message}`)); }
 }
 
 async function handleProject(arg) {
   if (!arg) {
-    console.log("");
-    console.log(`  当前项目: ${c("yellow", STATE.projectKey)}`);
-    console.log(`  工作目录: ${c("gray", STATE.workdir)}`);
-    console.log(c("gray", "  用法: /project <key>  或  /projects 查看所有"));
-    console.log("");
+    console.log(`  当前: ${c("yellow", STATE.projectKey)}`);
+    console.log(`  目录: ${c("gray", STATE.workdir)}`);
     return;
   }
   const key = sanitizeName(arg);
   try {
     const meta = await readProject(key);
     const abs = path.resolve(meta.path);
-    const stat = await fs.stat(abs);
-    if (!stat.isDirectory()) throw new Error("不是目录");
-
+    if (!(await fs.stat(abs)).isDirectory()) throw new Error("不是目录");
     STATE.projectKey = key;
     STATE.workdir = abs;
-    // 切换项目 → 新会话
     STATE.sessionId = newSessionId();
     STATE.url = null;
     STATE.createdAt = new Date().toISOString();
@@ -541,75 +434,32 @@ async function handleProject(arg) {
     STATE.taskHistory = [];
     STATE.taskCount = 0;
     STATE.startedAt = Date.now();
-
-    // 更新 lastUsedAt
     meta.lastUsedAt = new Date().toISOString();
     await writeProject(key, meta);
-
-    console.log("");
-    console.log(c("green", `  ✅ 已切换到项目: ${key}`));
+    console.log(c("green", `  ✅ 切换到: ${key}`));
     console.log(`  工作目录: ${c("gray", STATE.workdir)}`);
-    console.log(`  会话 ID:  ${c("gray", STATE.sessionId)}`);
-    console.log("");
   } catch (e) {
-    console.log("");
-    console.log(c("red", `  ❌ 无法切换项目: ${e.message}`));
-    console.log(c("gray", "  用 /projects 查看所有项目"));
-    console.log("");
+    console.log(c("red", `  ❌ ${e.message}`));
   }
 }
 
-// ==========================================
-// 保存
-// ==========================================
 async function handleSave(name) {
-  if (!name && STATE.savedName) {
-    name = STATE.savedName;
-  }
-
+  if (!name && STATE.savedName) name = STATE.savedName;
   if (!name) {
     await refreshUrlFromServer();
-    const uuid = extractUuidFromUrl(STATE.url);
-    if (uuid) {
-      name = uuid;
-    } else {
-      name = STATE.sessionId;
-      console.log("");
-      console.log(c("yellow", "  ⚠️ 当前 URL 里没有 UUID，用 sessionId 命名"));
-    }
+    name = extractUuidFromUrl(STATE.url) || STATE.sessionId;
   }
-
   name = sanitizeName(name);
-
   try {
     const file = await saveSessionToDisk(name);
     STATE.savedName = name;
-    console.log("");
-    console.log(c("green", `  ✅ 会话已保存: ${name}`));
-    console.log(c("gray", `  项目: ${STATE.projectKey}`));
-    console.log(c("gray", `  sessionId: ${STATE.sessionId}`));
-    if (STATE.url) {
-      console.log(c("gray", `  网页 URL:  ${STATE.url}`));
-    }
+    console.log(c("green", `  ✅ 已保存: ${name}`));
     console.log(c("gray", `  文件: ${file}`));
-    console.log(c("gray", `  (后续任务完成后会自动更新)`));
-    console.log("");
-  } catch (e) {
-    console.log("");
-    console.log(c("red", `  ❌ 保存失败: ${e.message}`));
-    console.log("");
-  }
+  } catch (e) { console.log(c("red", `  ❌ ${e.message}`)); }
 }
 
-// ==========================================
-// 加载
-// ==========================================
 async function handleLoad(arg) {
-  if (!arg) {
-    await handleListSessions();
-    return;
-  }
-
+  if (!arg) { await handleListSessions(); return; }
   let name = arg;
   const num = parseInt(arg, 10);
   if (!isNaN(num) && String(num) === arg) {
@@ -617,20 +467,14 @@ async function handleLoad(arg) {
       STATE.lastSessionList = await listProjectSessions(STATE.projectKey);
     }
     if (num < 1 || num > STATE.lastSessionList.length) {
-      console.log("");
-      console.log(c("red", `  ❌ 编号 ${num} 超出范围 (1-${STATE.lastSessionList.length})`));
-      console.log("");
-      return;
+      console.log(c("red", `  ❌ 编号超范围`)); return;
     }
     const s = STATE.lastSessionList[num - 1];
     name = s.name || s.sessionId;
   }
-
   name = sanitizeName(name);
-
   try {
     const data = await readSessionFile(STATE.projectKey, name);
-
     STATE.sessionId = data.sessionId;
     STATE.site = data.site || STATE.site;
     STATE.url = data.url || null;
@@ -646,89 +490,39 @@ async function handleLoad(arg) {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            sessionId: STATE.sessionId,
-            url: STATE.url,
-            site: STATE.site,
+            sessionId: STATE.sessionId, url: STATE.url, site: STATE.site,
           }),
         });
-      } catch (e) {
-        console.log(c("yellow", `  ⚠️ 无法通知 server 绑定: ${e.message}`));
-      }
+      } catch {}
     }
-
-    console.log("");
-    console.log(c("green", `  ✅ 已加载会话: ${name}`));
-    console.log(`  项目:      ${c("yellow", STATE.projectKey)}`);
-    console.log(`  工作目录:  ${c("gray", STATE.workdir)}`);
-    console.log(`  站点:      ${c("yellow", STATE.site)}`);
-    console.log(`  会话 ID:   ${c("gray", STATE.sessionId)}`);
-    if (STATE.url) {
-      console.log(`  网页 URL:  ${c("gray", STATE.url)}`);
-    } else {
-      console.log(c("yellow", `  ⚠️ 该会话没有保存 url，下次任务将新建网页会话`));
-    }
-    console.log(`  任务数:    ${STATE.taskCount}`);
-    console.log("");
-  } catch (e) {
-    console.log("");
-    console.log(c("red", `  ❌ 加载失败: ${e.message}`));
-    console.log(c("gray", "  用 /load 查看所有会话"));
-    console.log("");
-  }
+    console.log(c("green", `  ✅ 已加载: ${name}`));
+    if (STATE.url) console.log(c("gray", `  URL: ${STATE.url}`));
+  } catch (e) { console.log(c("red", `  ❌ ${e.message}`)); }
 }
 
 async function handleListSessions() {
   try {
     const list = await listProjectSessions(STATE.projectKey);
     STATE.lastSessionList = list;
-
     console.log("");
-    if (list.length === 0) {
-      console.log(c("gray", `  (项目 "${STATE.projectKey}" 暂无保存的会话)`));
-      console.log(c("gray", "  用 /save 保存当前会话"));
-      console.log("");
-      return;
-    }
-    console.log(c("cyan", `💾 项目 "${STATE.projectKey}" 的会话 (${list.length}):`));
-    console.log("");
+    if (list.length === 0) { console.log(c("gray", "  (暂无会话)")); return; }
+    console.log(c("cyan", `💾 会话 (${list.length}):`));
     list.forEach((s, i) => {
-      const isCurrent = s.sessionId === STATE.sessionId;
-      const marker = isCurrent ? c("green", " ← 当前") : "";
-      const name = (s.name || s.sessionId);
-      const showName = name.length > 40 ? name.slice(0, 37) + "..." : name;
-      console.log(`  ${c("yellow", `[${i + 1}]`)} ${showName}${marker}`);
-      console.log(c("gray", `      站点: ${s.site}  任务: ${s.taskCount || 0}  更新: ${(s.updatedAt || "-").slice(0, 19)}`));
-      if (s.url) {
-        console.log(c("gray", `      url:  ${s.url}`));
-      }
+      const m = s.sessionId === STATE.sessionId ? c("green", " ← 当前") : "";
+      const name = s.name || s.sessionId;
+      console.log(`  [${i + 1}] ${name}${m}  ${c("gray", `${s.taskCount || 0}条`)}`);
     });
     console.log("");
-    console.log(c("gray", "  用 /load <编号> 或 /load <name> 加载"));
-    console.log("");
-  } catch (e) {
-    console.log(c("red", `  ❌ ${e.message}`));
-  }
+  } catch (e) { console.log(c("red", `  ❌ ${e.message}`)); }
 }
 
 async function handleUnsave(name) {
-  if (!name) {
-    console.log("");
-    console.log(c("red", "  ⚠️ 用法: /unsave <name>"));
-    console.log("");
-    return;
-  }
-  name = sanitizeName(name);
+  if (!name) { console.log(c("red", "  ⚠️ 用法: /unsave <name>")); return; }
   try {
-    await deleteSessionFile(STATE.projectKey, name);
+    await deleteSessionFile(STATE.projectKey, sanitizeName(name));
     if (STATE.savedName === name) STATE.savedName = null;
-    console.log("");
-    console.log(c("green", `  ✅ 已删除会话: ${name}`));
-    console.log("");
-  } catch (e) {
-    console.log("");
-    console.log(c("red", `  ❌ 删除失败: ${e.message}`));
-    console.log("");
-  }
+    console.log(c("green", `  ✅ 已删除: ${name}`));
+  } catch (e) { console.log(c("red", `  ❌ ${e.message}`)); }
 }
 
 // ==========================================
@@ -738,248 +532,129 @@ async function executeTask(task) {
   STATE.busy = true;
   STATE.cancelling = false;
   STATE.currentAbort = new AbortController();
-  const taskStartedAt = Date.now();
+  const t0 = Date.now();
   const taskId = ++STATE.taskCount;
 
+  let attachments = [];
+  try { attachments = await loadReferencedFiles(task); } catch {}
+
   console.log("");
-  console.log(c("cyan", `┌─ 任务 #${taskId} ──────────────────────────────────`));
-  task.split("\n").forEach(l => {
-    console.log(c("cyan", "│ ") + c("gray", l));
-  });
-  console.log(c("cyan", "└───────────────────────────────────────────────────"));
+  console.log(c("cyan", `┌─ 任务 #${taskId} ${"─".repeat(40)}`));
+  task.split("\n").forEach(l => console.log(c("cyan", "│ ") + c("gray", l)));
+  if (attachments.length > 0) {
+    console.log(c("cyan", "│"));
+    attachments.forEach(a => {
+      if (a.error) {
+        console.log(c("cyan", "│ ") + c("red", `📎 @${a.path}  [${a.error}]`));
+      } else {
+        const kb = (a.size / 1024).toFixed(1);
+        console.log(c("cyan", "│ ") + c("green", `📎 @${a.path}  (${kb}KB)`));
+      }
+    });
+  }
+  console.log(c("cyan", "└" + "─".repeat(50)));
+
+  const finalTask = buildTaskWithAttachments(task, attachments);
 
   let ok = false;
   try {
-    const result = await runAgent(task, {
+    const result = await runAgent(finalTask, {
       site: STATE.site,
       sessionId: STATE.sessionId,
       signal: STATE.currentAbort.signal,
       quiet: true,
-      workdir: STATE.workdir,        // ★ 从项目来
+      workdir: STATE.workdir,
     });
     ok = result.ok;
-    if (!result.ok) {
-      console.log("");
-      console.log(c("red", `  ❌ 任务失败: ${result.reason}`));
-    }
+    if (!result.ok) console.log(c("red", `  ❌ 失败: ${result.reason}`));
   } catch (err) {
-    console.log("");
     if (err.name === "AbortError" || /取消|abort/i.test(err.message)) {
-      console.log(c("yellow", "  ⏹️  任务已取消"));
+      console.log(c("yellow", "  ⏹️  已取消"));
     } else {
-      console.log(c("red", `  ❌ 任务异常: ${err.message}`));
+      console.log(c("red", `  ❌ 异常: ${err.message}`));
     }
   } finally {
-    if (cancelTimer) {
-      clearTimeout(cancelTimer);
-      cancelTimer = null;
-    }
-    const elapsed = Date.now() - taskStartedAt;
+    const elapsed = Date.now() - t0;
     STATE.taskHistory.push({ task, ok, elapsed });
     STATE.busy = false;
     STATE.cancelling = false;
     STATE.currentAbort = null;
-
     await refreshUrlFromServer();
-
-    if (STATE.savedName) {
-      try {
-        await saveSessionToDisk(STATE.savedName);
-      } catch (e) {
-        console.log(c("yellow", `  ⚠️ 自动保存失败: ${e.message}`));
-      }
-    }
-
-    console.log("");
-  }
-}
-
-// ==========================================
-// 初始化：确定项目
-// ==========================================
-async function initProject() {
-  await fs.mkdir(PROJECTS_DIR, { recursive: true });
-
-  const cwd = process.cwd();
-  const { key, meta } = await findOrCreateProjectForCwd(cwd);
-
-  STATE.projectKey = key;
-  STATE.workdir = path.resolve(meta.path);
-}
-
-// ==========================================
-// REPL
-// ==========================================
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-  prompt: c("cyan", "agent> "),
-  historySize: 500,
-  removeHistoryDuplicates: true,
-});
-
-let cancelTimer = null;
-
-// ==========================================
-// 输入缓冲
-// ==========================================
-function resetDebounce() {
-  if (INPUT.timer) clearTimeout(INPUT.timer);
-  INPUT.timer = setTimeout(onDebounceEnd, DEBOUNCE_MS);
-}
-
-function onDebounceEnd() {
-  INPUT.timer = null;
-  if (INPUT.processing) return;
-  if (INPUT.buffer.length === 0) return;
-
-  if (INPUT.buffer.length === 1) {
-    processInput();
-    return;
-  }
-
-  if (INPUT.buffer[INPUT.buffer.length - 1] === "") {
-    INPUT.buffer.pop();
-    processInput();
-    return;
-  }
-
-  INPUT.multilineMode = true;
-  const n = INPUT.buffer.length;
-  process.stdout.write("\n");
-  console.log(c("yellow", `  📥 已接收 ${n} 行，按回车发送（Ctrl+C 取消）`));
-}
-
-async function processInput() {
-  if (INPUT.processing) return;
-
-  const raw = INPUT.buffer.join("\n");
-  INPUT.buffer = [];
-  INPUT.multilineMode = false;
-  if (INPUT.timer) {
-    clearTimeout(INPUT.timer);
-    INPUT.timer = null;
-  }
-
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    if (!STATE.busy) rl.prompt();
-    return;
-  }
-
-  if (STATE.busy) {
-    console.log(c("gray", "  ⏳ 任务执行中，请稍候..."));
-    return;
-  }
-
-  INPUT.processing = true;
-  try {
-    if (trimmed.startsWith("/")) {
-      const firstLine = trimmed.split("\n")[0].trim();
-      await handleCommand(firstLine);
-    } else {
-      await executeTask(trimmed);
-    }
-  } catch (err) {
-    console.error(c("red", `  ❌ 输入处理异常: ${err.message}`));
-  } finally {
-    INPUT.processing = false;
-    if (!STATE.busy) rl.prompt();
-  }
-}
-
-rl.on("line", (line) => {
-  const isBlank = line.trim() === "";
-
-  if (INPUT.multilineMode) {
-    if (isBlank) {
-      console.log(c("green", "  ✅ 已确认，发送中..."));
-      processInput();
-    } else {
-      INPUT.buffer.push(line);
-      console.log(c("gray", `  (+ 第 ${INPUT.buffer.length} 行，按回车发送)`));
-    }
-    return;
-  }
-
-  INPUT.buffer.push(line);
-  resetDebounce();
-});
-
-// ==========================================
-// SIGINT / close
-// ==========================================
-rl.on("SIGINT", () => {
-  if (!STATE.busy && INPUT.buffer.length > 0) {
-    INPUT.buffer = [];
-    INPUT.multilineMode = false;
-    if (INPUT.timer) {
-      clearTimeout(INPUT.timer);
-      INPUT.timer = null;
-    }
-    console.log("");
-    console.log(c("yellow", "  🧹 已清空未发送的输入"));
-    rl.prompt();
-    return;
-  }
-
-  if (!STATE.busy) {
-    (async () => {
-      if (STATE.savedName) {
-        try {
-          await saveSessionToDisk(STATE.savedName);
-          console.log("");
-          console.log(c("green", `  💾 已自动保存会话: ${STATE.savedName}`));
-        } catch {}
-      }
-      console.log("");
-      console.log(c("cyan", "  👋 再见！"));
-      console.log("");
-      process.exit(0);
-    })();
-    return;
-  }
-
-  if (STATE.cancelling) {
-    console.log("");
-    console.log(c("red", "  🚪 强制退出"));
-    process.exit(1);
-  }
-
-  STATE.cancelling = true;
-  console.log("");
-  console.log(c("yellow", "  ⏹️  正在取消当前任务..."));
-  console.log(c("gray", "  (再按一次 Ctrl+C 强制退出)"));
-
-  try { STATE.currentAbort?.abort(); } catch {}
-
-  cancelTimer = setTimeout(() => {
-    if (STATE.busy) {
-      console.log("");
-      console.log(c("yellow", "  ⚠️  取消超时，强制释放"));
-      STATE.busy = false;
-      STATE.cancelling = false;
-      STATE.currentAbort = null;
-      rl.prompt();
-    }
-  }, 8000);
-});
-
-rl.on("close", () => {
-  (async () => {
     if (STATE.savedName) {
       try { await saveSessionToDisk(STATE.savedName); } catch {}
     }
     console.log("");
-    console.log(c("cyan", "  👋 再见！"));
+  }
+}
+
+// ==========================================
+// SIGINT（任务执行期间触发）
+// ==========================================
+process.on("SIGINT", () => {
+  if (STATE.busy) {
+    if (STATE.cancelling) {
+      console.log("\n" + c("red", "  🚪 强制退出"));
+      process.exit(1);
+    }
+    STATE.cancelling = true;
     console.log("");
+    console.log(c("yellow", "  ⏹️  正在取消任务..."));
+    console.log(c("gray", "  (再按一次 Ctrl+C 强制退出)"));
+    try { STATE.currentAbort?.abort(); } catch {}
+  } else {
+    console.log("");
+    console.log(c("cyan", "  👋 再见！"));
     process.exit(0);
-  })();
+  }
 });
 
 // ==========================================
 // 启动
 // ==========================================
+async function initProject() {
+  await fs.mkdir(PROJECTS_DIR, { recursive: true });
+  const { key, meta } = await findOrCreateProjectForCwd(process.cwd());
+  STATE.projectKey = key;
+  STATE.workdir = path.resolve(meta.path);
+}
+
 await initProject();
+
+const prompt = new InlinePrompt({
+  prompt: "agent> ",
+  getWorkdir: () => STATE.workdir,
+  maxCandidates: 8,
+});
+
 printBanner();
-rl.prompt();
+
+// 主循环
+while (true) {
+  let input;
+  try {
+    input = await prompt.start();
+  } catch (e) {
+    console.error("输入异常:", e.message);
+    break;
+  }
+
+  if (input === null) {
+    // Ctrl+C 且 buffer 为空 → 退出
+    console.log("");
+    console.log(c("cyan", "  👋 再见！"));
+    if (STATE.savedName) {
+      try { await saveSessionToDisk(STATE.savedName); } catch {}
+    }
+    process.exit(0);
+  }
+
+  const trimmed = String(input).trim();
+  if (!trimmed) continue;
+
+  if (trimmed.startsWith("/")) {
+    const first = trimmed.split("\n")[0].trim();
+    await handleCommand(first);
+  } else {
+    await executeTask(trimmed);
+  }
+}

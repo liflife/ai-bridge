@@ -12,6 +12,10 @@ import { runAgent } from "../agent/agent.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECTS_DIR = path.join(os.homedir(), ".ai-bridge-agent", "projects");
 
+const MAX_FILE_SIZE = 200 * 1024;   // 单文件 200KB
+const MAX_TOTAL_SIZE = 500 * 1024;  // 总计 500KB
+
+
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
@@ -260,6 +264,90 @@ app.delete("/api/projects/:key/sessions/:sessionId", async (req, res) => {
   }
 });
 
+
+
+// ==========================================
+// @ 文件引用处理
+// ==========================================
+function parseFileReferences(text) {
+  const regex = /@(?:"([^"]+)"|([^\s@]+))/g;
+  const refs = [];
+  let m;
+  while ((m = regex.exec(text)) !== null) {
+    const p = m[1] !== undefined ? m[1] : m[2];
+    if (!p) continue;
+    refs.push({ full: m[0], path: p });
+  }
+  return refs;
+}
+
+async function loadReferencedFiles(text, workdir) {
+  const refs = parseFileReferences(text);
+  if (refs.length === 0) return [];
+
+  const results = [];
+  let totalSize = 0;
+  const BINARY_EXTS = new Set([
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp",
+    ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".wav",
+    ".zip", ".rar", ".7z", ".tar", ".gz",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".exe", ".dll", ".so", ".dylib", ".bin",
+    ".woff", ".woff2", ".ttf", ".otf",
+    ".class", ".jar", ".pyc",
+  ]);
+
+  for (const ref of refs) {
+    const abs = path.isAbsolute(ref.path)
+      ? ref.path
+      : path.resolve(workdir, ref.path);
+
+    try {
+      const stat = await fs.stat(abs);
+      if (!stat.isFile()) {
+        results.push({ path: ref.path, abs, error: "不是文件" });
+        continue;
+      }
+      if (stat.size > MAX_FILE_SIZE) {
+        results.push({
+          path: ref.path,
+          abs,
+          error: `文件过大 (${Math.round(stat.size / 1024)}KB)`,
+        });
+        continue;
+      }
+      if (totalSize + stat.size > MAX_TOTAL_SIZE) {
+        results.push({ path: ref.path, abs, error: "超出总计限制" });
+        continue;
+      }
+      const ext = path.extname(abs).toLowerCase();
+      if (BINARY_EXTS.has(ext)) {
+        results.push({ path: ref.path, abs, error: "二进制文件，跳过" });
+        continue;
+      }
+      const content = await fs.readFile(abs, "utf-8");
+      totalSize += stat.size;
+      results.push({ path: ref.path, abs, content, size: stat.size });
+    } catch (e) {
+      results.push({ path: ref.path, abs, error: e.message });
+    }
+  }
+  return results;
+}
+
+function buildTaskWithAttachments(originalTask, attachments) {
+  const ok = attachments.filter(a => a.content !== undefined);
+  if (ok.length === 0) return originalTask;
+
+  const parts = [];
+  for (const a of ok) {
+    const fence = "`".repeat(3);
+    parts.push(`### @${a.path}\n\n${fence}\n${a.content}\n${fence}`);
+  }
+
+  return `${originalTask}\n\n---\n\n【引用的文件】\n\n${parts.join("\n\n")}`;
+}
+
 // ==========================================
 // 运行 agent
 // ==========================================
@@ -375,6 +463,67 @@ app.post("/api/abort", (req, res) => {
   if (!entry) return res.json({ ok: false, error: "任务不存在或已结束" });
   try { entry.abort(); } catch {}
   res.json({ ok: true });
+});
+
+
+
+// ==========================================
+// 文件浏览 API（用于 @ 候选）
+// ==========================================
+app.get("/api/browse", async (req, res) => {
+  const projectKey = String(req.query.projectKey || "").replace(/[^a-zA-Z0-9._-]/g, "_");
+  const subDir = String(req.query.dir || "");
+
+  if (!projectKey) {
+    return res.status(400).json({ error: "缺少 projectKey" });
+  }
+
+  let meta;
+  try {
+    meta = await readProject(projectKey);
+  } catch {
+    return res.status(404).json({ error: "项目不存在" });
+  }
+
+  const basePath = path.resolve(meta.path);
+  const targetPath = subDir ? path.resolve(basePath, subDir) : basePath;
+
+  // 安全：不能跳出项目目录
+  if (!targetPath.startsWith(basePath)) {
+    return res.status(403).json({ error: "路径越界" });
+  }
+
+  try {
+    const entries = await fs.readdir(targetPath, { withFileTypes: true });
+    const dirs = [];
+    const files = [];
+
+    for (const e of entries) {
+      if (e.name.startsWith(".")) continue;
+      const fullPath = path.join(targetPath, e.name);
+      const relPath = subDir
+        ? `${subDir.replace(/\\/g, "/")}/${e.name}`
+        : e.name;
+
+      if (e.isDirectory()) {
+        dirs.push({ name: e.name, isDir: true, relPath: relPath + "/" });
+      } else {
+        let size = 0;
+        try {
+          const st = await fs.stat(fullPath);
+          size = st.size;
+        } catch {}
+        files.push({ name: e.name, isDir: false, size, relPath });
+      }
+    }
+
+    dirs.sort((a, b) => a.name.localeCompare(b.name));
+    files.sort((a, b) => a.name.localeCompare(b.name));
+
+    res.json({ entries: [...dirs, ...files] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ==========================================
