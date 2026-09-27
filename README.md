@@ -31,20 +31,8 @@
 - [FAQ](#faq)
 - [免责声明](#免责声明)
 
----
 
-## 它能做什么
-
-```
-你：帮我看看 F:/project/demo 下的代码结构，生成一个 README
-
-Agent：
-  1. list_dir("F:/project/demo")
-  2. read_file("F:/project/demo/package.json")
-  3. read_file("F:/project/demo/src/index.js")
-  4. write_file("F:/project/demo/README.md", "...")
-  5. final_answer("已生成 README.md，包含项目结构、安装方式和使用说明")
-```
+```bash
 
 Agent 通过提示词让 AI 输出**结构化 JSON 决策**，本地程序解析后**执行真实操作**（读写文件、执行命令、搜索代码），再把结果反馈给 AI，循环直到任务完成。
 
