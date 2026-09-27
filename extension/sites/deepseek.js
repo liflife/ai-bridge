@@ -33,6 +33,9 @@
         '[class*="assistant-message-main-content"]',
     },
 
+    // ==========================================
+    // 发送消息
+    // ==========================================
     async send(prompt, { newChat }) {
       console.log("[deepseek] send, newChat =", newChat);
 
@@ -50,12 +53,26 @@
         10000
       );
       console.log("[deepseek] 找到输入框");
-      input.focus();
 
+      // ★ 先清空输入框（第二轮可能残留）
+      input.focus();
+      try {
+        const setter = Object.getOwnPropertyDescriptor(
+          HTMLTextAreaElement.prototype, "value"
+        ).set;
+        setter.call(input, "");
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        await B.sleep(100);
+      } catch (e) {
+        console.warn("[deepseek] 清空输入框失败:", e.message);
+      }
+
+      // 写入内容
       B.setInputValue(input, prompt);
       input.dispatchEvent(new Event("change", { bubbles: true }));
-      await B.sleep(500 + Math.random() * 400);
+      await B.sleep(600 + Math.random() * 400);
 
+      // 找发送按钮
       const sendBtn = document.querySelector(this.selectors.send);
       console.log("[deepseek] 发送按钮:", sendBtn ? sendBtn.className.slice(0, 50) : "未找到");
 
@@ -76,104 +93,140 @@
         return;
       }
 
-      console.warn("[deepseek] 无发送按钮，尝试 Enter（可能被拒绝）");
+      console.warn("[deepseek] 无发送按钮，尝试 Enter");
       input.dispatchEvent(new KeyboardEvent("keydown", {
         key: "Enter", code: "Enter", keyCode: 13, which: 13,
         bubbles: true, cancelable: true,
       }));
     },
 
-    // ---------- 非流式：累积完整文本，done 时一次性发送 ----------
+    // ==========================================
+    // 监听回复 —— 非流式，累积完整文本，done 时一次性发送
+    // 核心：不依赖节点数量，用"基准文本"判断新回复
+    // ==========================================
     observeReply(onDelta, onDone) {
       const REPLY_SEL = this.selectors.reply;
-      const initialCount = document.querySelectorAll(REPLY_SEL).length;
-      console.log("[deepseek] 开始监听，已有", initialCount, "条答案节点");
+
+      // ---------- 文本提取（保留缩进、剥离 UI） ----------
+      const extractText = (node) => {
+        if (!node) return "";
+        const clone = node.cloneNode(true);
+
+        // pre → code 的 textContent
+        clone.querySelectorAll("pre").forEach(pre => {
+          const code = pre.querySelector("code");
+          const text = code ? (code.textContent || "") : (pre.textContent || "");
+          pre.replaceWith(document.createTextNode(text));
+        });
+
+        // 删按钮
+        clone.querySelectorAll("button, [role='button']").forEach(n => n.remove());
+
+        // 删代码块头部
+        clone.querySelectorAll(
+          '[class*="code-header"], [class*="code-toolbar"], [class*="code-block-header"], ' +
+          '[class*="toolbar"], [class*="copy"], [class*="download"]'
+        ).forEach(n => n.remove());
+
+        // 删纯语言名文本节点
+        const JUNK_RE = /^\s*(agent|python|py|javascript|js|typescript|ts|java|go|rust|bash|sh|shell|sql|html|css|json|xml|yaml|text|plaintext|复制|下载|copy|download)\s*$/i;
+        const walker = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
+        const toRemove = [];
+        while (walker.nextNode()) {
+          const n = walker.currentNode;
+          if (JUNK_RE.test(n.textContent || "")) toRemove.push(n);
+        }
+        toRemove.forEach(n => n.remove());
+
+        return clone.textContent || "";
+      };
+
+      // ---------- 取当前最后一条答案的文本 ----------
+      const getLastText = () => {
+        const nodes = document.querySelectorAll(REPLY_SEL);
+        if (nodes.length === 0) return "";
+        return extractText(nodes[nodes.length - 1]);
+      };
+
+      // ---------- 记录基准 ----------
+      const initialLastText = getLastText();
+      console.log("[deepseek] 开始监听, 基准最后一条长度:", initialLastText.length);
 
       let lastFullText = "";
+      let stableTicks = 0;
       let doneTimer = null;
       let stopped = false;
+      let startedAt = Date.now();
 
-      // ★ 只取 pre 里 <code> 的原始文本，其它普通文本用 textContent
-		const getText = () => {
-		  const nodes = document.querySelectorAll(REPLY_SEL);
-		  if (nodes.length <= initialCount) return "";
-		  const last = nodes[nodes.length - 1];
+      const STABLE_NEEDED = 10; // 300ms * 10 = 3 秒稳定
 
-		  const clone = last.cloneNode(true);
-
-		  // 1. pre → 内容替换（保留缩进和换行）
-		  clone.querySelectorAll("pre").forEach(pre => {
-			const code = pre.querySelector("code");
-			const text = code ? (code.textContent || "") : (pre.textContent || "");
-			pre.replaceWith(document.createTextNode(text));
-		  });
-
-		  // 2. 删按钮（复制、下载）
-		  clone.querySelectorAll("button, [role='button']").forEach(n => n.remove());
-
-		  // 3. 删代码块头部容器（"agent 复制 下载" 那一栏）
-		  clone.querySelectorAll(
-			'[class*="code-header"], [class*="code-toolbar"], [class*="code-block-header"], ' +
-			'[class*="toolbar"], [class*="copy"], [class*="download"]'
-		  ).forEach(n => n.remove());
-
-		  // 4. 遍历文本节点，删纯语言名
-		  const JUNK_RE = /^\s*(agent|python|py|javascript|js|typescript|ts|java|c\+\+|cpp|c#|csharp|go|golang|rust|ruby|php|swift|kotlin|bash|sh|shell|sql|html|css|json|xml|yaml|yml|markdown|md|text|plaintext|plain|复制|下载|copy|download)\s*$/i;
-		  const walker = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
-		  const toRemove = [];
-		  while (walker.nextNode()) {
-			const node = walker.currentNode;
-			if (JUNK_RE.test(node.textContent || "")) toRemove.push(node);
-		  }
-		  toRemove.forEach(n => n.remove());
-
-		  return clone.textContent || "";
-		};
-
+      // ---------- 完成 ----------
       const stop = () => {
         if (stopped) return;
         stopped = true;
-        observer.disconnect();
-        clearTimeout(doneTimer);
+        clearInterval(pollTimer);
+        clearTimeout(hardTimeout);
         console.log("[deepseek] 停止监听, 最终长度:", lastFullText.length);
       };
 
-      const observer = new MutationObserver(() => {
-        const text = getText();
-        if (!text) return;
+      const finish = () => {
+        if (stopped) return;
+        if (!lastFullText) return;
+        console.log("[deepseek] 判定完成，一次性发送完整文本, 长度:", lastFullText.length);
+        onDelta(lastFullText);
+        onDone();
+        stop();
+      };
 
-        // 只累积，不发 delta
-        if (text !== lastFullText) {
-          lastFullText = text;
-        }
+      // ---------- 轮询 ----------
+      const pollTimer = setInterval(() => {
+        if (stopped) return;
 
-        // 3 秒无变化 → 判定完成
-        clearTimeout(doneTimer);
-        doneTimer = setTimeout(() => {
-          if (!lastFullText) {
-            console.warn("[deepseek] 超时但无内容，直接结束");
-            onDone();
-            stop();
-            return;
+        const cur = getLastText();
+        if (!cur) return;
+
+        // 关键：只有当"最后一条文本"和"基准文本"不同时，才是新回复
+        // 如果 initialLastText 为空，则任何非空文本都算新回复
+        if (cur === initialLastText) return;
+
+        // 是新回复
+        if (cur !== lastFullText) {
+          // 内容还在变化
+          lastFullText = cur;
+          stableTicks = 0;
+          // 重置"稳定判定"
+          clearTimeout(doneTimer);
+          doneTimer = setTimeout(() => {
+            finish();
+          }, 3000);
+        } else {
+          // 内容未变化
+          stableTicks++;
+          // 双保险：即使 doneTimer 意外被清，稳定也完成
+          if (stableTicks >= STABLE_NEEDED) {
+            finish();
           }
-          console.log("[deepseek] 判定完成，一次性发送完整文本, 长度:", lastFullText.length);
-          // ★ 只发一次 delta（完整文本），紧跟 done
-          onDelta(lastFullText);
+        }
+      }, 300);
+
+      // ---------- 兜底：90 秒无内容强制结束 ----------
+      const hardTimeout = setTimeout(() => {
+        if (stopped) return;
+        if (!lastFullText) {
+          console.warn("[deepseek] 90 秒内未捕获到新内容，强制结束");
+          onDelta("");
           onDone();
           stop();
-        }, 3000);
-      });
-
-      observer.observe(document.body, {
-        childList: true,
-        subtree: true,
-        characterData: true,
-      });
+        }
+      }, 90 * 1000);
 
       return stop;
     },
   });
 
+  // ==========================================
+  // 从输入框向上找"发送按钮"
+  // ==========================================
   function findNearbyButton(el) {
     let p = el.parentElement;
     for (let i = 0; i < 6 && p && p !== document.body; i++, p = p.parentElement) {

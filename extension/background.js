@@ -16,9 +16,30 @@ function connect() {
   ws.onopen = () => console.log("[AI-BRIDGE] Local WS connected");
 
   ws.onmessage = async (event) => {
-    const msg = JSON.parse(event.data);
-    if (msg.type === "ping") return;
-    if (msg.type !== "command") return;
+	  const msg = JSON.parse(event.data);
+
+	  if (msg.type === "ping") return;
+
+	  // ★ 新增：处理 abort
+	  if (msg.type === "command" && msg.action === "abort") {
+		console.log("[AI-BRIDGE] 收到 abort, requestId:", msg.requestId);
+		// 通知所有相关 tab 停止
+		try {
+		  const tabs = await chrome.tabs.query({});
+		  for (const tab of tabs) {
+			try {
+			  await chrome.tabs.sendMessage(tab.id, {
+				type: "command",
+				action: "abort",
+				requestId: msg.requestId,
+			  });
+			} catch {}
+		  }
+		} catch {}
+		return;
+	  }
+
+	  if (msg.type !== "command") return;
 
     console.log("[AI-BRIDGE] 命令:", msg.sessionId, "url:", msg.url, "newChat:", msg.newChat);
 

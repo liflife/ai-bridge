@@ -17,11 +17,23 @@ const pending = new Map();       // requestId -> { res, sessionId }
 const sessionMap = new Map();    // sessionId -> { url, site }
 let extensionSocket = null;
 
+// ==========================================
+// WebSocket 服务
+// ==========================================
 const wss = new WebSocketServer({ port: 8765, path: "/ws" });
 
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url, "http://localhost");
-  if (url.searchParams.get("token") !== LOCAL_TOKEN) { ws.close(); return; }
+  if (url.searchParams.get("token") !== LOCAL_TOKEN) {
+    ws.close();
+    return;
+  }
+
+  // 如果已有扩展连接，关闭旧的
+  if (extensionSocket && extensionSocket !== ws && extensionSocket.readyState === 1) {
+    console.warn("[Server] 已有扩展连接，关闭旧连接");
+    try { extensionSocket.close(); } catch {}
+  }
 
   extensionSocket = ws;
   console.log("[Server] Extension connected");
@@ -29,8 +41,16 @@ wss.on("connection", (ws, req) => {
   ws.on("message", (data) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
-	console.log("[Server] message msg:",msg);
+
+    // ping 静默处理
     if (msg.type === "ping") return;
+
+    // 日志：只打非 ping 的关键事件
+    if (msg.event) {
+      console.log("[Server] event:", msg.event, "requestId:", msg.requestId || "-");
+    }
+
+    // ---------- 特殊事件：不关联 HTTP 响应 ----------
 
     // URL 绑定事件
     if (msg.event === "url_change" && msg.sessionId && msg.url) {
@@ -39,10 +59,27 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
+    // 扩展主动通知已中止
+    if (msg.event === "aborted" && msg.requestId) {
+      const entry = pending.get(msg.requestId);
+      if (entry && !entry.res.writableEnded) {
+        entry.res.write(`data: ${JSON.stringify({ event: "aborted" })}\n\n`);
+        entry.res.write("data: [DONE]\n\n");
+        entry.res.end();
+      }
+      pending.delete(msg.requestId);
+      return;
+    }
+
+    // ---------- 普通事件：转发给 HTTP 响应 ----------
+
     const entry = pending.get(msg.requestId);
     if (!entry) return;
     const res = entry.res;
-    if (res.writableEnded) { pending.delete(msg.requestId); return; }
+    if (res.writableEnded) {
+      pending.delete(msg.requestId);
+      return;
+    }
 
     if (msg.event === "started") {
       res.write(`data: ${JSON.stringify({ event: "started" })}\n\n`);
@@ -64,14 +101,30 @@ wss.on("connection", (ws, req) => {
     }
   });
 
-  ws.on("close", () => { extensionSocket = null; });
+  ws.on("error", (err) => {
+    console.error("[Server] WS error:", err.message);
+  });
+
   const pingTimer = setInterval(() => {
-    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: "ping" }));
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: "ping" }));
+    }
   }, 20000);
-  ws.on("close", () => clearInterval(pingTimer));
+
+  // 只注册一次 close，统一清理
+  ws.on("close", () => {
+    clearInterval(pingTimer);
+    // ★ 只有当前 socket 就是扩展连接时才清空，避免被旧连接误删
+    if (extensionSocket === ws) {
+      extensionSocket = null;
+      console.log("[Server] Extension disconnected");
+    }
+  });
 });
 
+// ==========================================
 // 串行队列，避免同一 tab 被并发操作
+// ==========================================
 let queue = Promise.resolve();
 function enqueue(fn) {
   const next = queue.then(fn, fn);
@@ -79,6 +132,48 @@ function enqueue(fn) {
   return next;
 }
 
+
+
+// ==========================================
+// Session 管理接口（供 CLI 使用）
+// ==========================================
+
+// 列出所有 session
+app.get("/v1/sessions", (req, res) => {
+  const list = [];
+  for (const [sessionId, info] of sessionMap.entries()) {
+    list.push({ sessionId, ...info });
+  }
+  res.json({ sessions: list });
+});
+
+// 查询单个 session
+app.get("/v1/sessions/:sessionId", (req, res) => {
+  const info = sessionMap.get(req.params.sessionId);
+  if (!info) return res.status(404).json({ error: "not found" });
+  res.json({ sessionId: req.params.sessionId, ...info });
+});
+
+// 手动绑定 session -> url（CLI 加载会话时调用）
+app.post("/v1/sessions/bind", (req, res) => {
+  const { sessionId, url, site } = req.body || {};
+  if (!sessionId || !url) {
+    return res.status(400).json({ error: "需要 sessionId 和 url" });
+  }
+  sessionMap.set(sessionId, { url, site: site || "deepseek" });
+  console.log(`[Server] 手动绑定 session=${sessionId} -> ${url}`);
+  res.json({ ok: true });
+});
+
+// 解绑
+app.delete("/v1/sessions/:sessionId", (req, res) => {
+  const ok = sessionMap.delete(req.params.sessionId);
+  res.json({ ok });
+});
+
+// ==========================================
+// HTTP API
+// ==========================================
 app.post("/v1/chat/completions", async (req, res) => {
   if (!extensionSocket || extensionSocket.readyState !== 1) {
     return res.status(503).json({ error: "扩展未连接" });
@@ -104,6 +199,15 @@ app.post("/v1/chat/completions", async (req, res) => {
   pending.set(requestId, { res, sessionId });
 
   await enqueue(() => new Promise((resolve) => {
+    let finished = false;
+
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      resolve();
+    };
+
+    // 发送命令给扩展
     try {
       extensionSocket.send(JSON.stringify({
         type: "command",
@@ -116,17 +220,51 @@ app.post("/v1/chat/completions", async (req, res) => {
         prompt,
       }));
     } catch (err) {
+      console.error("[Server] 发送命令失败:", err.message);
       if (!res.writableEnded) {
         res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
         res.end();
       }
       pending.delete(requestId);
-      return resolve();
+      return finish();
     }
+
+    // 客户端断开（CLI 里 Ctrl+C）
     res.on("close", () => {
-      if (!res.writableEnded) pending.delete(requestId);
-      resolve();
+      if (!res.writableEnded) {
+        console.warn("[Server] 客户端提前断开, requestId:", requestId);
+        // ★ 通知扩展中止当前生成
+        try {
+          if (extensionSocket && extensionSocket.readyState === 1) {
+            extensionSocket.send(JSON.stringify({
+              type: "command",
+              action: "abort",
+              requestId,
+            }));
+          }
+        } catch (err) {
+          console.error("[Server] 发送 abort 失败:", err.message);
+        }
+        pending.delete(requestId);
+      }
+      finish();
     });
+
+    // 超时保护：5 分钟没结果就强制释放队列
+    setTimeout(() => {
+      if (pending.has(requestId)) {
+        console.warn("[Server] 请求超时 5 分钟, requestId:", requestId);
+        const entry = pending.get(requestId);
+        if (entry && !entry.res.writableEnded) {
+          try {
+            entry.res.write(`data: ${JSON.stringify({ error: "timeout" })}\n\n`);
+            entry.res.end();
+          } catch {}
+        }
+        pending.delete(requestId);
+        finish();
+      }
+    }, 5 * 60 * 1000);
   }));
 });
 

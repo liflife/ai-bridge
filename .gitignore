@@ -81,3 +81,4 @@ $RECYCLE.BIN/
 *.seed
 *.pid.lock
 .lock-wscript
+/test

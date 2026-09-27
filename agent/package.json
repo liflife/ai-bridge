@@ -2,7 +2,12 @@
   "name": "ai-bridge-agent",
   "version": "0.1.0",
   "type": "module",
+  "bin": {
+    "ai-web-agent": "./cli.js"
+  },
   "scripts": {
-    "start": "node run.js"
+    "cli": "node cli.js",
+    "start": "node run.js",
+    "test": "node test.js"
   }
 }
