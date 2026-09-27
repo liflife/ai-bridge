@@ -1,0 +1,8 @@
+{
+  "name": "ai-bridge-agent",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node run.js"
+  }
+}

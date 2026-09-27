@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "Local AI Bridge",
+  "version": "0.2.0",
+  "permissions": ["tabs", "scripting", "storage"],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "https://claude.ai/*",
+    "https://gemini.google.com/*",
+    "https://www.kimi.com/*",
+    "https://chat.deepseek.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*",
+        "https://claude.ai/*",
+        "https://gemini.google.com/*",
+        "https://www.kimi.com/*",
+        "https://chat.deepseek.com/*"
+      ],
+      "js": [
+        "sites/common.js",
+        "sites/chatgpt.js",
+        "sites/claude.js",
+        "sites/deepseek.js",
+        "sites/gemini.js",
+        "sites/kimi.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*",
+        "https://claude.ai/*",
+        "https://gemini.google.com/*",
+        "https://www.kimi.com/*",
+        "https://chat.deepseek.com/*"
+      ],
+      "js": ["injected.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}
