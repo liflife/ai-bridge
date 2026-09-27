@@ -101,32 +101,29 @@
 
 		  const clone = last.cloneNode(true);
 
-		  // Step 1: pre → 用 code 的 textContent 替换，丢弃语言标签和按钮
+		  // 1. pre → 内容替换（保留缩进和换行）
 		  clone.querySelectorAll("pre").forEach(pre => {
 			const code = pre.querySelector("code");
 			const text = code ? (code.textContent || "") : (pre.textContent || "");
 			pre.replaceWith(document.createTextNode(text));
 		  });
 
-		  // Step 2: 删掉所有按钮
+		  // 2. 删按钮（复制、下载）
 		  clone.querySelectorAll("button, [role='button']").forEach(n => n.remove());
 
-		  // Step 3: 删掉代码块头部容器（可能还带"python"或"复制"）
+		  // 3. 删代码块头部容器（"agent 复制 下载" 那一栏）
 		  clone.querySelectorAll(
 			'[class*="code-header"], [class*="code-toolbar"], [class*="code-block-header"], ' +
 			'[class*="toolbar"], [class*="copy"], [class*="download"]'
 		  ).forEach(n => n.remove());
 
-		  // ★ Step 4: 关键 —— 遍历所有文本节点，删掉纯语言名/纯操作名
-		  const JUNK_RE = /^\s*(python|py|javascript|js|typescript|ts|java|c\+\+|cpp|c#|csharp|go|golang|rust|ruby|php|swift|kotlin|bash|sh|shell|sql|html|css|json|xml|yaml|yml|markdown|md|text|plaintext|plain|c|cpp|复制|下载|copy|download|run|运行)\s*$/i;
+		  // 4. 遍历文本节点，删纯语言名
+		  const JUNK_RE = /^\s*(agent|python|py|javascript|js|typescript|ts|java|c\+\+|cpp|c#|csharp|go|golang|rust|ruby|php|swift|kotlin|bash|sh|shell|sql|html|css|json|xml|yaml|yml|markdown|md|text|plaintext|plain|复制|下载|copy|download)\s*$/i;
 		  const walker = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
 		  const toRemove = [];
 		  while (walker.nextNode()) {
 			const node = walker.currentNode;
-			const t = node.textContent;
-			if (t && JUNK_RE.test(t)) {
-			  toRemove.push(node);
-			}
+			if (JUNK_RE.test(node.textContent || "")) toRemove.push(node);
 		  }
 		  toRemove.forEach(n => n.remove());
 

@@ -37,8 +37,7 @@ export const tools = {
       throw new Error("缺少 content，必须用 <<<CONTENT>>> 包裹文件内容");
     }
     await fs.writeFile(path, content, "utf-8");
-    const preview = content.slice(0, 100);
-    return `已写入 ${path}（${content.length} 字符）。内容预览：\n${preview}`;
+    return `已写入 ${path}（${content.length} 字符）。`;
   },
 
   async list_dir({ path }) {
