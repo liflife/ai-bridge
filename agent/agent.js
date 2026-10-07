@@ -11,6 +11,16 @@ import { Logger } from "../shared/logger.js";
 const log = new Logger("agent", { color: "\x1b[32m" }); // 绿色
 
 // ==========================================
+// ★ 方案 B：同一 sessionId 只发一次完整 System Prompt
+// ==========================================
+const PROMPT_SENT = new Set();
+
+// 供调试用：清空缓存（下次会重发完整 prompt）
+export function resetPromptCache() {
+  PROMPT_SENT.clear();
+}
+
+// ==========================================
 // 收集系统信息（接受 workdir）
 // ==========================================
 function collectSystemInfo(workdir) {
@@ -51,9 +61,6 @@ function collectSystemInfo(workdir) {
   };
 }
 
-// ==========================================
-// 生成系统信息段落
-// ==========================================
 // ==========================================
 // 生成系统信息段落
 // ==========================================
@@ -120,7 +127,7 @@ function buildSystemSection(info) {
 }
 
 // ==========================================
-// 构建 System Prompt（每次调用用当前 workdir）
+// 构建 System Prompt
 // ==========================================
 function buildSystemPrompt(workdir) {
   const info = collectSystemInfo(workdir);
@@ -293,8 +300,8 @@ export async function runAgent(task, {
   sessionId = "agent-" + Date.now(),
   signal,
   quiet = false,
-  onEvent,                    // 事件回调，供 UI 使用
-  workdir,                    // ★ 新增：指定工作目录
+  onEvent,
+  workdir,
 } = {}) {
 
   const emit = typeof onEvent === "function" ? onEvent : (() => {});
@@ -310,7 +317,6 @@ export async function runAgent(task, {
 
   const chatOpts = { site, sessionId, signal };
 
-  // 统一的输出函数：console + emit
   const logIcon = (icon, text) => {
     if (!quiet) console.log(`  ${icon} ${text}`);
     emit({ type: "log", icon, text });
@@ -322,7 +328,7 @@ export async function runAgent(task, {
   };
 
   // ==========================================
-  // 1) 先做 workdir 处理（必须在任何引用 targetWorkdir 之前）
+  // 1) workdir 处理
   // ==========================================
   const originalCwd = process.cwd();
   const targetWorkdir = workdir ? path.resolve(workdir) : originalCwd;
@@ -359,7 +365,6 @@ export async function runAgent(task, {
     }
   }
 
-  // ★ 现在 targetWorkdir 已可用，可以安全写 audit
   log.audit("TASK_START", {
     sessionId, site,
     workdir: targetWorkdir,
@@ -368,10 +373,9 @@ export async function runAgent(task, {
   });
 
   // ==========================================
-  // 2) 主流程（统一在 try/finally 里，保证恢复 cwd）
+  // 2) 主流程
   // ==========================================
   try {
-    // ★ 每次基于当前 cwd 生成 SYSTEM_PROMPT
     const SYSTEM_PROMPT = buildSystemPrompt(process.cwd());
 
     if (!quiet) {
@@ -393,26 +397,30 @@ export async function runAgent(task, {
 
     checkAbort();
 
-    // 第 1 步
-    let reply = await chat(
-      `${SYSTEM_PROMPT}
+    // ==========================================
+    // ★ 方案 A + B：第 1 步的 prompt 处理
+    // ==========================================
+    const needFullPrompt = !PROMPT_SENT.has(sessionId);
 
----
+    if (!quiet) {
+      console.log(`[agent] prompt 模式: ${needFullPrompt ? "完整（首次）" : "精简（复用）"}`);
+    }
 
-【重要提醒】本次会话规则如下，请忘掉之前对话里学到的任何工具定义：
-1. 每次回复都要用 \`\`\`agent 代码块包裹整段内容。
-2. 写文件用 write_file，action_input 只写 path。
-3. 文件内容用 <<<CONTENT>>> ... <<<END_CONTENT>>> 包裹在 JSON 之后。
-4. CONTENT 块里直接写原始内容（保留缩进），不要再套代码块。
-5. 路径统一用正斜杠（/），不要用反斜杠。
-6. 不要做 base64、不要做转义。
+    const firstPrompt = needFullPrompt
+      ? `${SYSTEM_PROMPT}
 
 用户任务：${task}
 
-请直接输出第一个决策。不要解释，不要道歉，不要说你无法执行。`,
-      chatOpts
-    );
+请直接输出第一个决策。`
+      : `用户任务：${task}
+
+请直接输出第一个决策。（规则同前，只输出 \`\`\`agent 代码块）`;
+
+    let reply = await chat(firstPrompt, chatOpts);
     checkAbort();
+
+    // 调用成功后再记录，避免失败时丢失缓存
+    PROMPT_SENT.add(sessionId);
 
     for (let step = 0; step < maxSteps; step++) {
       logHeader(step + 1, maxSteps);
@@ -422,15 +430,12 @@ export async function runAgent(task, {
       let parsed = parseAgentOutput(reply);
 
       if (!parsed) {
-		// ★ 无论 quiet，都打印原始 reply 到控制台
-		  console.log("═══════ LLM 原始输出reply═══════");
-		  console.log(reply);
-		  console.log("═══════════════════════════════════════");
-		  // ★ 同时写入日志文件
-		  log.error("JSON 解析失败,reply=", reply);
-		  logIcon("⚠️", "JSON 解析失败，让 LLM 重做...");
-  
-  
+        console.log("═══════ LLM 原始输出reply═══════");
+        console.log(reply);
+        console.log("═══════════════════════════════════════");
+        log.error("JSON 解析失败,reply=", reply);
+        logIcon("⚠️", "JSON 解析失败，让 LLM 重做...");
+
         reply = await chat(
           `你刚才的输出无法解析。请重新输出，严格遵守：
 1. 整段内容必须放在 \`\`\`agent ... \`\`\` 代码块里。
@@ -458,9 +463,7 @@ ${reply.slice(0, 800)}`,
         }
         const result = { ok: false, reason: "parse_error", raw: reply };
         log.audit("TASK_END", {
-          sessionId,
-          ok: false,
-          reason: "parse_error",
+          sessionId, ok: false, reason: "parse_error",
           elapsed: Date.now() - startedAt,
         });
         emit({ type: "done", ...result });
@@ -487,10 +490,7 @@ ${reply.slice(0, 800)}`,
         }
         const result = { ok: true, answer: parsed.final_answer, elapsed, steps: step + 1 };
         log.audit("TASK_END", {
-          sessionId,
-          ok: true,
-          elapsed,
-          steps: step + 1,
+          sessionId, ok: true, elapsed, steps: step + 1,
           answer: String(parsed.final_answer).slice(0, 200),
         });
         emit({ type: "done", ...result });
@@ -523,12 +523,9 @@ ${reply.slice(0, 800)}`,
         thought: parsed.thought || "",
       });
       log.audit("TOOL_CALL", {
-        step: step + 1,
-        tool: toolName,
-        args: inputSummary,
+        step: step + 1, tool: toolName, args: inputSummary,
       });
 
-      // ★ 先执行工具，拿到结果再打 TOOL_RESULT
       const toolStartedAt = Date.now();
       let observation;
       let toolSuccess = true;
@@ -541,12 +538,9 @@ ${reply.slice(0, 800)}`,
       const toolElapsed = Date.now() - toolStartedAt;
       const truncated = String(observation).slice(0, 3000);
 
-      // ★ 现在 toolSuccess / toolElapsed / truncated 都已可用
       log.audit("TOOL_RESULT", {
-        step: step + 1,
-        tool: toolName,
-        ok: toolSuccess,
-        elapsed: toolElapsed,
+        step: step + 1, tool: toolName,
+        ok: toolSuccess, elapsed: toolElapsed,
         head: truncated.slice(0, 200),
       });
 
@@ -557,10 +551,8 @@ ${reply.slice(0, 800)}`,
       }
       emit({
         type: "tool-result",
-        step: step + 1,
-        toolName,
-        ok: toolSuccess,
-        elapsed: toolElapsed,
+        step: step + 1, toolName,
+        ok: toolSuccess, elapsed: toolElapsed,
         observation: truncated,
       });
 
@@ -602,19 +594,16 @@ ${reply.slice(0, 800)}`,
       checkAbort();
     }
 
-    // ★ 超过最大步数
+    // 超过最大步数
     console.error(`[agent] ❌ 超过最大步数 ${maxSteps}`);
     const result = { ok: false, reason: "max_steps" };
     log.audit("TASK_END", {
-      sessionId,
-      ok: false,
-      reason: "max_steps",
+      sessionId, ok: false, reason: "max_steps",
       elapsed: Date.now() - startedAt,
     });
     emit({ type: "done", ...result });
     return result;
   } finally {
-    // ★ 恢复原 CWD
     if (didChdir) {
       try {
         process.chdir(originalCwd);
@@ -629,10 +618,6 @@ ${reply.slice(0, 800)}`,
 // ==========================================
 // JSON 解析
 // ==========================================
-
-/**
- * 从 LLM 输出提取决策
- */
 export function parseAgentOutput(text) {
   if (!text) return null;
 
@@ -654,9 +639,6 @@ export function parseAgentOutput(text) {
   return parsed;
 }
 
-/**
- * 提取 <<<CONTENT>>> ... <<<END_CONTENT>>> 之间的内容
- */
 function extractContentBlock(text) {
   const m = text.match(/<<<CONTENT>>>([\s\S]*?)<<<END_CONTENT>>>/);
   if (!m) return { rawContent: null, cleanedText: text };
@@ -675,9 +657,6 @@ function extractContentBlock(text) {
   return { rawContent: content, cleanedText };
 }
 
-/**
- * 剥掉 ```lang ... ``` 外壳
- */
 function stripMarkdownCodeFence(content) {
   const m = content.match(/^\s*(`{3,})[^\n]*\n([\s\S]*?)\n\1\s*$/);
   if (m) return m[2];
@@ -691,9 +670,6 @@ function stripMarkdownCodeFence(content) {
   return content;
 }
 
-/**
- * 只解析 JSON
- */
 function parseJSONOnly(text) {
   if (!text) return null;
 
