@@ -9,7 +9,7 @@ const SITE_URLS = {
   gemini: "https://gemini.google.com/app",
   kimi: "https://www.kimi.com/",
   deepseek: "https://chat.deepseek.com/",
-  wenxin: "https://chat.baidu.com/",      // ★ 加这行
+  wenxin: "https://wenxin.baidu.com/",      // ★ 加这行
 };
 
 function connect() {
