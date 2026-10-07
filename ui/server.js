@@ -15,6 +15,11 @@ const PROJECTS_DIR = path.join(os.homedir(), ".ai-bridge-agent", "projects");
 const MAX_FILE_SIZE = 200 * 1024;   // 单文件 200KB
 const MAX_TOTAL_SIZE = 500 * 1024;  // 总计 500KB
 
+import { Logger, LOG_ROOT_DIR } from "../shared/logger.js";
+const log = new Logger("ui", { color: "\x1b[35m" }); // 品红
+
+
+
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -353,6 +358,12 @@ function buildTaskWithAttachments(originalTask, attachments) {
 // ==========================================
 app.post("/api/run", async (req, res) => {
   const { task, sessionId, site, projectKey } = req.body || {};
+  log.audit("RUN_START", {
+    sessionId, site, projectKey,
+    taskHead: task?.slice(0, 100),
+    taskLen: task?.length,
+  });
+
   if (!task || typeof task !== "string") {
     return res.status(400).json({ error: "缺少 task 参数" });
   }
@@ -360,7 +371,7 @@ app.post("/api/run", async (req, res) => {
     return res.status(400).json({ error: "缺少 projectKey" });
   }
 
-  // 读项目，拿到 path
+  // 读项目
   let projectMeta;
   try {
     projectMeta = await readProject(projectKey);
@@ -368,6 +379,37 @@ app.post("/api/run", async (req, res) => {
     return res.status(404).json({ error: "项目不存在" });
   }
 
+  // ★ 解析 @ 引用（注意：在 try 外面声明变量）
+  let attachments = [];
+  try {
+    attachments = await loadReferencedFiles(task, projectMeta.path);
+  } catch (e) {
+    log.error("[Server] 解析 @ 引用失败:", e.message);
+  }
+
+  // ★ 附件审计
+  if (attachments.length > 0) {
+    log.audit("ATTACHMENTS", {
+      count: attachments.length,
+      files: attachments.map(a => ({
+        path: a.path,
+        size: a.size,
+        ok: a.content !== undefined,
+      })),
+    });
+    attachments.forEach(a => {
+      if (a.error) {
+        log.warn(`  📎 @${a.path}  [${a.error}]`);
+      } else {
+        log.info(`  📎 @${a.path}  (${(a.size / 1024).toFixed(1)}KB)`);
+      }
+    });
+  }
+
+  // ★ 组装最终任务
+  const finalTask = buildTaskWithAttachments(task, attachments);
+
+  // SSE
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
@@ -385,6 +427,19 @@ app.post("/api/run", async (req, res) => {
   };
 
   send("task-id", { taskId });
+
+  // ★ 附件事件（现在可以访问 attachments 了）
+  if (attachments.length > 0) {
+    send("agent-event", {
+      type: "attachments",
+      attachments: attachments.map(a => ({
+        path: a.path,
+        size: a.size,
+        error: a.error,
+      })),
+    });
+  }
+
   running.set(taskId, { abort: () => ac.abort(), res });
 
   res.on("close", () => {
@@ -397,12 +452,12 @@ app.post("/api/run", async (req, res) => {
   let finalResult = null;
 
   try {
-    finalResult = await runAgent(task, {
+    finalResult = await runAgent(finalTask, {
       site: site || "deepseek",
       sessionId,
       signal: ac.signal,
       quiet: true,
-      workdir: projectMeta.path,      // ★ 用项目的 path
+      workdir: projectMeta.path,
       onEvent: (e) => send("agent-event", e),
     });
     send("done", finalResult || { ok: true });
@@ -411,17 +466,22 @@ app.post("/api/run", async (req, res) => {
     finalResult = { ok: false, reason: "exception", message: err.message };
   } finally {
     running.delete(taskId);
+    log.audit("RUN_END", {
+      taskId,
+      ok: finalResult?.ok,
+      reason: finalResult?.reason,
+      elapsed: Date.now() - startedAt,
+    });
     try { res.end(); } catch {}
   }
 
-  // ★ 更新会话文件
+  // 更新会话
   if (sessionId) {
     try {
       let sess;
       try {
         sess = await readSession(projectKey, sessionId);
       } catch {
-        // 会话不存在，创建
         const now = new Date().toISOString();
         sess = {
           sessionId,
@@ -448,10 +508,12 @@ app.post("/api/run", async (req, res) => {
 
       await writeSession(projectKey, sessionId, sess);
     } catch (e) {
-      console.error("[Server] 更新会话失败:", e.message);
+      log.error("[Server] 更新会话失败:", e.message);
     }
   }
 });
+
+
 
 // ==========================================
 // 停止
@@ -544,6 +606,9 @@ app.get("/api/system", (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "127.0.0.1", async () => {
   await ensureDir(PROJECTS_DIR);
+  log.info(`Web UI: http://127.0.0.1:${PORT}`);
+  log.info(`项目目录: ${PROJECTS_DIR}`);
+  log.info(`日志目录: ${LOG_ROOT_DIR}/ui`);
   console.log("");
   console.log("╔═══════════════════════════════════════════════════╗");
   console.log("║              🌐  AI Agent Web UI                  ║");

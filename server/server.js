@@ -2,6 +2,9 @@ import express from "express";
 import { WebSocketServer } from "ws";
 import crypto from "crypto";
 
+import { Logger } from "../shared/logger.js";
+const log = new Logger("server", { color: "\x1b[36m" }); // 青色
+
 const app = express();
 app.use(express.json());
 app.use((req, res, next) => {
@@ -36,7 +39,7 @@ wss.on("connection", (ws, req) => {
   }
 
   extensionSocket = ws;
-  console.log("[Server] Extension connected");
+  log.info("[Server] Extension connected");
 
   ws.on("message", (data) => {
     let msg;
@@ -45,9 +48,16 @@ wss.on("connection", (ws, req) => {
     // ping 静默处理
     if (msg.type === "ping") return;
 
+	  // 关键事件写审计
+    if (msg.event === "started")  log.audit("WS_STARTED",  { requestId: msg.requestId });
+    if (msg.event === "url_change") log.audit("WS_URL",     { sessionId: msg.sessionId, url: msg.url });
+    if (msg.event === "done")     log.audit("WS_DONE",     { requestId: msg.requestId });
+    if (msg.event === "error")    log.audit("WS_ERROR",    { requestId: msg.requestId, message: msg.message });
+	
+	
     // 日志：只打非 ping 的关键事件
     if (msg.event) {
-      console.log("[Server] event:", msg.event, "requestId:", msg.requestId || "-");
+      log.info("[Server] event:", msg.event, "requestId:", msg.requestId || "-");
     }
 
     // ---------- 特殊事件：不关联 HTTP 响应 ----------
@@ -55,7 +65,7 @@ wss.on("connection", (ws, req) => {
     // URL 绑定事件
     if (msg.event === "url_change" && msg.sessionId && msg.url) {
       sessionMap.set(msg.sessionId, { url: msg.url, site: msg.site });
-      console.log(`[Server] session=${msg.sessionId} -> ${msg.url}`);
+      log.info(`[Server] session=${msg.sessionId} -> ${msg.url}`);
       return;
     }
 
@@ -117,7 +127,7 @@ wss.on("connection", (ws, req) => {
     // ★ 只有当前 socket 就是扩展连接时才清空，避免被旧连接误删
     if (extensionSocket === ws) {
       extensionSocket = null;
-      console.log("[Server] Extension disconnected");
+      log.info("[Server] Extension disconnected");
     }
   });
 });
@@ -161,7 +171,7 @@ app.post("/v1/sessions/bind", (req, res) => {
     return res.status(400).json({ error: "需要 sessionId 和 url" });
   }
   sessionMap.set(sessionId, { url, site: site || "deepseek" });
-  console.log(`[Server] 手动绑定 session=${sessionId} -> ${url}`);
+  log.info(`[Server] 手动绑定 session=${sessionId} -> ${url}`);
   res.json({ ok: true });
 });
 
@@ -178,17 +188,23 @@ app.post("/v1/chat/completions", async (req, res) => {
   if (!extensionSocket || extensionSocket.readyState !== 1) {
     return res.status(503).json({ error: "扩展未连接" });
   }
-
+  const startedAt = Date.now();   // ★ 加这一行
   const requestId = crypto.randomUUID();
   const site = req.body.site || "chatgpt";
   const sessionId = req.body.session_id || "default";
   const prompt = req.body.messages?.at(-1)?.content || "";
-
+	log.audit("HTTP_REQUEST", {
+		path: "/v1/chat/completions",
+		site,
+		sessionId: sessionId,
+		promptLen: prompt.length,
+		promptHead: prompt.slice(0, 100),
+	  });
   const saved = sessionMap.get(sessionId);
   const url = (!req.body.new_chat && saved && saved.url) ? saved.url : null;
   const newChat = !url;
 
-  console.log(`[Server] 请求 sid=${sessionId} site=${site} url=${url || "(新会话)"}`);
+  log.info(`[Server] 请求 sid=${sessionId} site=${site} url=${url || "(新会话)"}`);
 
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -266,6 +282,16 @@ app.post("/v1/chat/completions", async (req, res) => {
       }
     }, 5 * 60 * 1000);
   }));
+  
+  // 记一次完成
+	const elapsed = Date.now() - startedAt;
+	log.audit("HTTP_RESPONSE", {
+	  path: "/v1/chat/completions",
+	  requestId,
+	  elapsed,
+	  ok: true,
+	});
+  
 });
 
-app.listen(8787, "127.0.0.1", () => console.log("API: http://127.0.0.1:8787"));
+app.listen(8787, "127.0.0.1", () => log.info("API: http://127.0.0.1:8787"));

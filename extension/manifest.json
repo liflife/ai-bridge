@@ -9,7 +9,8 @@
     "https://claude.ai/*",
     "https://gemini.google.com/*",
     "https://www.kimi.com/*",
-    "https://chat.deepseek.com/*"
+    "https://chat.deepseek.com/*",
+    "https://chat.baidu.com/*"
   ],
   "background": {
     "service_worker": "background.js",
@@ -43,7 +44,8 @@
         "https://claude.ai/*",
         "https://gemini.google.com/*",
         "https://www.kimi.com/*",
-        "https://chat.deepseek.com/*"
+        "https://chat.deepseek.com/*",
+        "https://chat.baidu.com/*"
       ],
       "js": ["injected.js"],
       "run_at": "document_start",

@@ -11,6 +11,9 @@ import crypto from "crypto";
 import { runAgent } from "./agent.js";
 import { InlinePrompt } from "./input.js";
 
+import { Logger } from "../shared/logger.js";
+const log = new Logger("agent", { color: "\x1b[32m" });
+
 // ==========================================
 // 常量
 // ==========================================
@@ -355,6 +358,9 @@ async function handleCommand(input) {
   const cmd = parts[0].toLowerCase();
   const args = parts.slice(1);
 
+  // 每个命令
+  log.audit("CLI_COMMAND", { cmd: firstLine });
+  
   switch (cmd) {
     case "/help": case "/h": case "/?":
       printHelp(); break;
@@ -367,6 +373,8 @@ async function handleCommand(input) {
       }
       console.log("");
       console.log(c("cyan", "  👋 再见！"));
+	  // 退出
+	  log.info(`CLI 退出, 会话=${STATE.sessionId}`);
       process.exit(0);
     case "/clear":
       console.clear();
@@ -535,6 +543,11 @@ async function executeTask(task) {
   const t0 = Date.now();
   const taskId = ++STATE.taskCount;
 
+  log.audit("CLI_TASK", {
+  task: task.slice(0, 200),
+  attachments: attachments.map(a => a.path),
+  });
+  
   let attachments = [];
   try { attachments = await loadReferencedFiles(task); } catch {}
 

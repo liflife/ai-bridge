@@ -7,6 +7,9 @@ import os from "os";
 import path from "path";
 import fs from "fs/promises";
 
+import { Logger } from "../shared/logger.js";
+const log = new Logger("agent", { color: "\x1b[32m" }); // 绿色
+
 // ==========================================
 // 收集系统信息（接受 workdir）
 // ==========================================
@@ -51,6 +54,9 @@ function collectSystemInfo(workdir) {
 // ==========================================
 // 生成系统信息段落
 // ==========================================
+// ==========================================
+// 生成系统信息段落
+// ==========================================
 function buildSystemSection(info) {
   return `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 【运行环境信息】
@@ -75,7 +81,42 @@ function buildSystemSection(info) {
    - ❌ 错误: F:\\project\\ai-bridge\\sort.py
 2. 相对路径是相对于"当前工作目录"解析的。
 3. 如果用户没指定路径，默认在当前工作目录下创建文件。
-4. 路径中如果有中文或空格，正常书写即可，不需要转义。`;
+4. 路径中如果有中文或空格，正常书写即可，不需要转义。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【编译运行规范 — Windows 必须遵守】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚠️ Windows 中文环境默认使用 GBK 编码，而写出的源文件是 UTF-8。
+   直接编译运行会报"编码 GBK 的不可映射字符"错误。
+   编译和运行任何语言时，必须显式指定 UTF-8 编码。
+
+【Java】
+- 编译: javac -encoding UTF-8 FileName.java
+- 运行: java -Dfile.encoding=UTF-8 ClassName
+- 完整命令（Windows）:
+  cd /d <目录> && javac -encoding UTF-8 Hello.java && java -Dfile.encoding=UTF-8 Hello
+
+【Python】
+- Windows 上 Python 默认也可能用 GBK。运行方式：
+  set PYTHONIOENCODING=utf-8 && python hello.py
+  或者直接在源码开头加: # -*- coding: utf-8 -*-
+  更推荐: 在 Python 3 里加 sys.stdout.reconfigure(encoding='utf-8')
+
+【Node.js】
+- 一般不需要额外指定。
+- 若输出中文乱码: chcp 65001 && node app.js
+
+【C / C++】
+- 编译: gcc -finput-charset=UTF-8 -fexec-charset=UTF-8 hello.c -o hello.exe
+- 或 g++ -finput-charset=UTF-8 -fexec-charset=UTF-8 hello.cpp -o hello.exe
+
+【通用规则】
+1. 只要生成包含中文的源文件，编译/运行时一律加 UTF-8 参数。
+2. Windows 命令用 \`&&\` 连接；路径用正斜杠 /。
+3. exec_shell 在 Windows 上使用 cmd，可以直接用 \`cd /d F:/path && ...\`。
+4. 一次性给出完整的编译+运行命令，不要分开调用。
+5. 如果第一次编译因为编码失败，直接加上 -encoding UTF-8 重试，不要换其他方案。`;
 }
 
 // ==========================================
@@ -281,7 +322,7 @@ export async function runAgent(task, {
   };
 
   // ==========================================
-  // ★ workdir 处理
+  // 1) 先做 workdir 处理（必须在任何引用 targetWorkdir 之前）
   // ==========================================
   const originalCwd = process.cwd();
   const targetWorkdir = workdir ? path.resolve(workdir) : originalCwd;
@@ -308,11 +349,27 @@ export async function runAgent(task, {
       if (!quiet) {
         console.error(`❌ 工作目录无效: ${targetWorkdir} — ${err.message}`);
       }
+      log.audit("TASK_END", {
+        sessionId, ok: false, reason: "workdir_invalid",
+        message: result.message,
+        elapsed: Date.now() - startedAt,
+      });
       emit({ type: "done", ...result });
       return result;
     }
   }
 
+  // ★ 现在 targetWorkdir 已可用，可以安全写 audit
+  log.audit("TASK_START", {
+    sessionId, site,
+    workdir: targetWorkdir,
+    taskHead: task.slice(0, 100),
+    taskLen: task.length,
+  });
+
+  // ==========================================
+  // 2) 主流程（统一在 try/finally 里，保证恢复 cwd）
+  // ==========================================
   try {
     // ★ 每次基于当前 cwd 生成 SYSTEM_PROMPT
     const SYSTEM_PROMPT = buildSystemPrompt(process.cwd());
@@ -365,11 +422,15 @@ export async function runAgent(task, {
       let parsed = parseAgentOutput(reply);
 
       if (!parsed) {
-        if (!quiet) {
-          console.log(`  💬 JSON 解析失败,文本: ${reply}`);
-          console.log(`  💬 ----------------------------`);
-        }
-        logIcon("⚠️", "JSON 解析失败，让 LLM 重做...");
+		// ★ 无论 quiet，都打印原始 reply 到控制台
+		  console.log("═══════ LLM 原始输出reply═══════");
+		  console.log(reply);
+		  console.log("═══════════════════════════════════════");
+		  // ★ 同时写入日志文件
+		  log.error("JSON 解析失败,reply=", reply);
+		  logIcon("⚠️", "JSON 解析失败，让 LLM 重做...");
+  
+  
         reply = await chat(
           `你刚才的输出无法解析。请重新输出，严格遵守：
 1. 整段内容必须放在 \`\`\`agent ... \`\`\` 代码块里。
@@ -383,7 +444,7 @@ ${reply.slice(0, 800)}`,
           chatOpts
         );
         checkAbort();
-        logIcon("🔁", `LLM 重试: ${reply.slice(0, 200)}${reply.length > 200 ? "..." : ""}`);
+        logIcon("🔁", `LLM 重试: ${reply}`);
         parsed = parseAgentOutput(reply);
       }
 
@@ -396,6 +457,12 @@ ${reply.slice(0, 800)}`,
           console.log("╚═══════════════════════════════════════════════════╝");
         }
         const result = { ok: false, reason: "parse_error", raw: reply };
+        log.audit("TASK_END", {
+          sessionId,
+          ok: false,
+          reason: "parse_error",
+          elapsed: Date.now() - startedAt,
+        });
         emit({ type: "done", ...result });
         return result;
       }
@@ -419,6 +486,13 @@ ${reply.slice(0, 800)}`,
           console.log("");
         }
         const result = { ok: true, answer: parsed.final_answer, elapsed, steps: step + 1 };
+        log.audit("TASK_END", {
+          sessionId,
+          ok: true,
+          elapsed,
+          steps: step + 1,
+          answer: String(parsed.final_answer).slice(0, 200),
+        });
         emit({ type: "done", ...result });
         return result;
       }
@@ -448,7 +522,13 @@ ${reply.slice(0, 800)}`,
         input: toolInput,
         thought: parsed.thought || "",
       });
+      log.audit("TOOL_CALL", {
+        step: step + 1,
+        tool: toolName,
+        args: inputSummary,
+      });
 
+      // ★ 先执行工具，拿到结果再打 TOOL_RESULT
       const toolStartedAt = Date.now();
       let observation;
       let toolSuccess = true;
@@ -460,6 +540,15 @@ ${reply.slice(0, 800)}`,
       }
       const toolElapsed = Date.now() - toolStartedAt;
       const truncated = String(observation).slice(0, 3000);
+
+      // ★ 现在 toolSuccess / toolElapsed / truncated 都已可用
+      log.audit("TOOL_RESULT", {
+        step: step + 1,
+        tool: toolName,
+        ok: toolSuccess,
+        elapsed: toolElapsed,
+        head: truncated.slice(0, 200),
+      });
 
       if (toolSuccess) {
         logIcon("✅", `完成 (${formatElapsed(toolElapsed)}): ${truncated.slice(0, 100)}${truncated.length > 100 ? "..." : ""}`);
@@ -513,8 +602,15 @@ ${reply.slice(0, 800)}`,
       checkAbort();
     }
 
+    // ★ 超过最大步数
     console.error(`[agent] ❌ 超过最大步数 ${maxSteps}`);
     const result = { ok: false, reason: "max_steps" };
+    log.audit("TASK_END", {
+      sessionId,
+      ok: false,
+      reason: "max_steps",
+      elapsed: Date.now() - startedAt,
+    });
     emit({ type: "done", ...result });
     return result;
   } finally {

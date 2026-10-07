@@ -1,50 +1,45 @@
 // ==========================================
-// sites/deepseek.js
+// sites/wenxin.js — 百度文心一言适配器
+// 目标站点: chat.baidu.com (原 wenxin.baidu.com / yiyan.baidu.com)
 // ==========================================
 (function () {
   const B = window.AI_BRIDGE;
-  if (!B) { console.error("[deepseek] AI_BRIDGE 未加载"); return; }
+  if (!B) { console.error("[wenxin] AI_BRIDGE 未加载"); return; }
 
   B.register({
-    name: "deepseek",
-    host: "chat.deepseek.com",
+    name: "wenxin",                              // ★ 改这里
+    host: ["chat.baidu.com"],
 
     selectors: {
       newChat:
-        'button[aria-label*="新对话"], ' +
+        'button[aria-label*="新建"], ' +
         'button[aria-label*="New chat"], ' +
-        'div[role="button"][aria-label*="新对话"], ' +
-        'div[role="button"][aria-label*="New chat"]',
+        'div[class*="new-chat"], ' +
+        'div[class*="newChat"]',
 
-      input:
-        'textarea[placeholder*="发送消息"], ' +
-        'textarea[placeholder*="DeepSeek"], ' +
-        'textarea',
+      input: "#chat-textarea",
 
       send:
+        '#chat-submit-button, ' +
         'button[aria-label*="发送"], ' +
         'button[aria-label*="Send"], ' +
-        'div[role="button"][aria-label*="发送"], ' +
-        'div[role="button"][aria-label*="Send"], ' +
         'button[type="submit"]',
 
       reply:
-        '.ds-markdown.ds-assistant-message-main-content, ' +
-        '[class*="assistant-message-main-content"]',
+        '[class*="answer-content"], ' +
+        '[class*="markdown-body"], ' +
+        '[class*="assistant-message"]',
     },
 
-    // ==========================================
-    // 发送消息（缩短各阶段等待）
-    // ==========================================
     async send(prompt, { newChat }) {
-      console.log("[deepseek] send, newChat =", newChat);
+      console.log("[wenxin] send, newChat =", newChat);
 
       if (newChat) {
         const newBtn = document.querySelector(this.selectors.newChat);
         if (newBtn) {
-          console.log("[deepseek] 点击新建会话");
+          console.log("[wenxin] 点击新建会话");
           newBtn.click();
-          await B.sleep(500);   // 1200 → 500
+          await B.sleep(800);
         }
       }
 
@@ -52,8 +47,8 @@
         () => document.querySelector(this.selectors.input),
         10000
       );
+      console.log("[wenxin] 找到输入框");
 
-      // 清空输入框（不再等 100ms）
       input.focus();
       try {
         const setter = Object.getOwnPropertyDescriptor(
@@ -62,44 +57,27 @@
         setter.call(input, "");
         input.dispatchEvent(new Event("input", { bubbles: true }));
       } catch (e) {
-        console.warn("[deepseek] 清空输入框失败:", e.message);
+        console.warn("[wenxin] 清空输入框失败:", e.message);
       }
 
-      // 写入内容
       B.setInputValue(input, prompt);
       input.dispatchEvent(new Event("change", { bubbles: true }));
+      await B.sleep(200 + Math.random() * 200);
 
-      // 等 React 更新按钮状态（200-400ms 足够）
-      await B.sleep(200 + Math.random() * 200);   // 600-1000 → 200-400
-
-      // 找发送按钮
       const sendBtn = document.querySelector(this.selectors.send);
-      if (sendBtn) {
-        const disabled = sendBtn.disabled || sendBtn.getAttribute("aria-disabled") === "true";
-        if (!disabled) {
-          sendBtn.click();
-          return;
-        }
-      }
-
-      const nearBtn = findNearbyButton(input);
-      if (nearBtn) {
-        nearBtn.click();
+      if (sendBtn && !sendBtn.disabled) {
+        console.log("[wenxin] 点击发送按钮");
+        sendBtn.click();
         return;
       }
 
-      console.warn("[deepseek] 无发送按钮，尝试 Enter");
+      console.warn("[wenxin] 未找到发送按钮，尝试 Enter");
       input.dispatchEvent(new KeyboardEvent("keydown", {
         key: "Enter", code: "Enter", keyCode: 13, which: 13,
         bubbles: true, cancelable: true,
       }));
     },
 
-    // ==========================================
-    // 监听回复
-    // 优化：用 textContent 快速比较，只有真的变了才 clone
-    //       轮询间隔 300→150，稳定判定 1500→1000
-    // ==========================================
     observeReply(onDelta, onDone) {
       const REPLY_SEL = this.selectors.reply;
 
@@ -116,18 +94,9 @@
         clone.querySelectorAll("button, [role='button']").forEach(n => n.remove());
 
         clone.querySelectorAll(
-          '[class*="code-header"], [class*="code-toolbar"], [class*="code-block-header"], ' +
+          '[class*="code-header"], [class*="code-toolbar"], ' +
           '[class*="toolbar"], [class*="copy"], [class*="download"]'
         ).forEach(n => n.remove());
-
-        const JUNK_RE = /^\s*(agent|python|py|javascript|js|typescript|ts|java|go|rust|bash|sh|shell|sql|html|css|json|xml|yaml|text|plaintext|复制|下载|copy|download)\s*$/i;
-        const walker = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
-        const toRemove = [];
-        while (walker.nextNode()) {
-          const n = walker.currentNode;
-          if (JUNK_RE.test(n.textContent || "")) toRemove.push(n);
-        }
-        toRemove.forEach(n => n.remove());
 
         return clone.textContent || "";
       };
@@ -183,12 +152,12 @@
       const initialQuick = initialNode ? (initialNode.textContent || "") : "";
       lastQuickText = initialQuick;
 
-      console.log("[deepseek] 开始监听, 基准长度:", initialQuick.length);
+      console.log("[wenxin] 开始监听, 基准长度:", initialQuick.length);
 
       let doneTimer = null;
       let stopped = false;
       let firstSeenAt = 0;
-      let lastSeenText = "";   // ★ 新增
+      let lastSeenText = "";
 
       const stop = () => {
         if (stopped) return;
@@ -197,114 +166,69 @@
         clearInterval(idleTimer);
         clearTimeout(hardTimeout);
         clearTimeout(doneTimer);
-        console.log("[deepseek] 停止监听, 最终长度:", lastFullText.length);
+        console.log("[wenxin] 停止监听, 最终长度:", lastFullText.length);
       };
 
       const finish = (reason) => {
         if (stopped) return;
-        if (!lastFullText) {
-          console.warn("[deepseek] finish 但内容为空，跳过");
-          return;
-        }
-        console.log(`[deepseek] 判定完成 (${reason}), 长度:`, lastFullText.length);
+        if (!lastFullText) return;
+        console.log(`[wenxin] 判定完成 (${reason}), 长度:`, lastFullText.length);
         onDelta(lastFullText);
         onDone();
         stop();
       };
 
-      // ---------- 轮询（间隔 150ms） ----------
       const pollTimer = setInterval(() => {
         if (stopped) return;
 
         const cur = getText();
         if (!cur) return;
-
         if (cur === initialQuick) return;
 
         if (!firstSeenAt) firstSeenAt = Date.now();
 
-        // ★ 只有内容真的变化了才重置完成定时器
         const changed = cur !== lastSeenText;
         if (changed) {
           lastSeenText = cur;
-          if (doneTimer) {
-            clearTimeout(doneTimer);
-            doneTimer = null;
-          }
+          if (doneTimer) { clearTimeout(doneTimer); doneTimer = null; }
         }
 
-        // 不完整 → 不允许完成
         if (!isLikelyComplete(cur)) {
-          if (doneTimer) {
-            clearTimeout(doneTimer);
-            doneTimer = null;
-          }
+          if (doneTimer) { clearTimeout(doneTimer); doneTimer = null; }
           return;
         }
 
-        // 内容没变 + 已有倒计时 → 等它到期
         if (doneTimer) return;
 
-        // 内容完整且刚稳定 → 启动 1 秒倒计时
         doneTimer = setTimeout(() => {
           if (stopped) return;
-          if (!isLikelyComplete(lastFullText)) {
-            doneTimer = null;
-            return;
-          }
+          if (!isLikelyComplete(lastFullText)) { doneTimer = null; return; }
           finish("1s 稳定");
         }, 1000);
       }, 150);
 
-      // ---------- 兜底 1：180 秒硬超时 ----------
       const hardTimeout = setTimeout(() => {
         if (stopped) return;
         if (!lastFullText) {
-          console.warn("[deepseek] 180 秒未捕获内容，强制结束");
-          onDelta("");
-          onDone();
-          stop();
+          console.warn("[wenxin] 180 秒未捕获内容");
+          onDelta(""); onDone(); stop();
         } else {
-          console.warn("[deepseek] 180 秒仍未闭合，强制发送");
           finish("180s 硬超时");
         }
       }, 180 * 1000);
 
-      // ---------- 兜底 2：60 秒静默强制 ----------
       const idleTimer = setInterval(() => {
         if (stopped) return;
         if (!lastFullText || !firstSeenAt) return;
         const idleFor = Date.now() - firstSeenAt;
         if (!isLikelyComplete(lastFullText) && idleFor > 60 * 1000) {
-          console.warn(`[deepseek] 内容 ${Math.round(idleFor / 1000)}s 未闭合，强制发送`);
           finish("60s 静默强制");
         }
       }, 5000);
 
       return stop;
     },
-	
-	
-	
-	
-	
-	
   });
 
-  function findNearbyButton(el) {
-    let p = el.parentElement;
-    for (let i = 0; i < 6 && p && p !== document.body; i++, p = p.parentElement) {
-      const btns = [...p.querySelectorAll("button")];
-      if (btns.length > 0 && btns.length < 6) {
-        const svgBtn = btns.find(b => b.querySelector("svg"));
-        if (svgBtn) return svgBtn;
-        const sendBtn = btns.find(b => /send|submit/i.test(b.className));
-        if (sendBtn) return sendBtn;
-        if (btns.length === 1) return btns[0];
-      }
-    }
-    return null;
-  }
-
-  console.log("[deepseek] 适配器已注册");
+  console.log("[wenxin] 适配器已注册");
 })();
